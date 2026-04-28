@@ -804,12 +804,12 @@ async function getFfmpeg() {
   if (!ffmpegPromise) {
     ffmpegPromise = (async () => {
       const { FFmpeg } = await import("@ffmpeg/ffmpeg");
-      const { toBlobURL } = await import("@ffmpeg/util");
       const ff = new FFmpeg();
-      const baseURL = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
+      const coreURL = chrome.runtime.getURL("ffmpeg/ffmpeg-core.js");
+      const wasmURL = chrome.runtime.getURL("ffmpeg/ffmpeg-core.wasm");
       await ff.load({
-        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
-        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
+        coreURL,
+        wasmURL,
       });
       return ff;
     })();
@@ -923,7 +923,7 @@ async function saveSubtitle(
   const blob = new Blob([merged], { type: isVtt ? "text/vtt" : "text/plain" });
   const url = URL.createObjectURL(blob);
   try {
-    await chrome.downloads.download({ url, filename, saveAs: false });
+    await requestSwDownload(url, filename, false);
   } finally {
     setTimeout(() => URL.revokeObjectURL(url), 60_000);
   }
@@ -990,12 +990,47 @@ function pad2(n: number): string { return String(n).padStart(2, "0"); }
 function pad3(n: number): string { return String(n).padStart(3, "0"); }
 
 /* ------------------------- save ------------------------- */
+//
+// chrome.downloads is not exposed in offscreen documents — calling it here
+// throws "Cannot read properties of undefined (reading 'download')". Route
+// the actual download through the service worker, which does have the API.
+// The offscreen document keeps the generated blob URL alive long enough for
+// the SW to pass it to chrome.downloads.
 
 async function saveBlob(blob: Blob, filename: string): Promise<void> {
   const url = URL.createObjectURL(blob);
   try {
-    await chrome.downloads.download({ url, filename, saveAs: true });
+    await requestSwDownload(url, filename, true);
   } finally {
     setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  }
+}
+
+async function requestSwDownload(
+  url: string,
+  filename: string,
+  saveAs: boolean,
+): Promise<void> {
+  const resp = await new Promise<{ ok: boolean; error?: string }>((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      {
+        type: "downloads:save",
+        url,
+        filename,
+        saveAs,
+        target: "sw",
+      } satisfies RuntimeMessage,
+      (response: { ok: boolean; error?: string } | undefined) => {
+        const err = chrome.runtime.lastError;
+        if (err) {
+          reject(new Error(`Failed to hand off download to service worker: ${err.message}`));
+          return;
+        }
+        resolve(response ?? { ok: false, error: "No response from service worker." });
+      },
+    );
+  });
+  if (!resp?.ok) {
+    throw new Error(resp?.error || "Service worker failed to save the file.");
   }
 }

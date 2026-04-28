@@ -136,5 +136,6 @@ export type RuntimeMessage = Targeted &
       }
     | { type: "download:progress"; payload: DownloadProgress }
     | { type: "download:cancel"; jobId: string }
+    | { type: "downloads:save"; url: string; filename: string; saveAs: boolean }
     | { type: "offscreen:ready" }
   );

@@ -37,6 +37,15 @@ for (const slug of slugs) {
     continue;
   }
   const pkg = JSON.parse(readFileSync(resolve(pkgDir, "package.json"), "utf8"));
+  if (
+    pkg.dependencies?.["@ffmpeg/core"] &&
+    !existsSync(resolve(distDir, "ffmpeg/ffmpeg-core.wasm"))
+  ) {
+    console.error(
+      `[fail ] ${slug}: missing dist/ffmpeg/ffmpeg-core.wasm — run \`npm run build\` before packing`,
+    );
+    process.exit(1);
+  }
   const version = pkg.version ?? "0.0.0";
   const versioned = `${slug}-v${version}.zip`;
   const alias = `${slug}.zip`;

@@ -28,6 +28,7 @@ import type {
 } from "@/lib/types";
 import { classify, hashId, suggestedFilename } from "@/lib/streamClassify";
 
+const STREAM_SEGMENT_RE = /\.(ts|m4s|cmfv|cmfa|mp4v|mp4a)(\?|$|#)/i;
 const MAX_STREAMS_PER_TAB = 64;
 const SESSION_KEY = "msg.streamsByTab.v1";
 const JOBS_KEY = "msg.jobs.v1";
@@ -233,6 +234,10 @@ async function handleContextClick(
         );
         return;
       }
+      if (isStreamSegment(url)) {
+        notify("This is a media segment, not a standalone playable file. Capture the HLS/DASH manifest instead.");
+        return;
+      }
       // HLS / DASH playlists go through the merge pipeline; everything else
       // is a direct browser download.
       if (/\.m3u8(\?|$|#)/i.test(url) || /\.mpd(\?|$|#)/i.test(url)) {
@@ -259,6 +264,10 @@ async function handleContextClick(
     }
     case MENU_LINK: {
       if (!info.linkUrl) return;
+      if (isStreamSegment(info.linkUrl)) {
+        notify("This is a media segment, not a standalone playable file. Capture the HLS/DASH manifest instead.");
+        return;
+      }
       try {
         await chrome.downloads.download({ url: info.linkUrl, saveAs: true });
       } catch (err) {
@@ -329,7 +338,7 @@ chrome.webRequest.onHeadersReceived.addListener(
     const contentType = headerLookup(details.responseHeaders, "content-type");
     const kind = classify(details.url, contentType);
     if (!kind) return;
-    if (kind === "mp4" && /\.ts(\?|$|#)/i.test(details.url)) return;
+    if (isStreamSegment(details.url)) return;
     if (kind === "image") return;
 
     void restoreFromSession().then(async () => {
@@ -481,6 +490,19 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, sender, sendResponse)
         sendResponse({ ok: true });
         return;
       }
+      case "downloads:save": {
+        try {
+          await chrome.downloads.download({
+            url: msg.url,
+            filename: msg.filename,
+            saveAs: msg.saveAs,
+          });
+          sendResponse({ ok: true });
+        } catch (err) {
+          sendResponse({ ok: false, error: (err as Error).message });
+        }
+        return;
+      }
       case "download:progress": {
         if (msg.payload.phase === "done" || msg.payload.phase === "error") {
           await dropJob(msg.payload.jobId);
@@ -556,6 +578,10 @@ async function dropJob(jobId: string): Promise<void> {
   jobsById.delete(jobId);
   await persistJobs();
   await removeRefererRule(jobId);
+}
+
+function isStreamSegment(url: string): boolean {
+  return STREAM_SEGMENT_RE.test(url.split("#")[0]);
 }
 
 /* --------------------------- DNR Referer rules ---------------------------- */
