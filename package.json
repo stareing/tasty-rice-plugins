@@ -1,0 +1,22 @@
+{
+  "name": "@my-blog/plugins",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Workspace for self-published browser extensions, desktop addons and small utilities surfaced on the /apps page.",
+  "workspaces": [
+    "*"
+  ],
+  "scripts": {
+    "build": "npm run --workspaces --if-present build",
+    "dev": "echo 'Pick a plugin: cd <plugin>/ && npm run dev'",
+    "type-check": "npm run --workspaces --if-present type-check",
+    "lint": "npm run --workspaces --if-present lint",
+    "clean": "rm -rf */dist */node_modules"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
