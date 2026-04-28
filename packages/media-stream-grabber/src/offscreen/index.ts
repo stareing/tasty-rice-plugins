@@ -442,6 +442,10 @@ async function runDownloadHls(
       }
       audioRendition = audioRendition || audioCandidates.find((a) => a.default) || audioCandidates[0];
     }
+    audioRendition =
+      audioRendition ||
+      masterParsed.renditions.find((r) => r.type === "AUDIO" && r.default) ||
+      masterParsed.renditions.find((r) => r.type === "AUDIO");
   } else {
     videoPlaylistUrl = stream.url;
   }
@@ -873,41 +877,73 @@ async function remuxToMp4(
   audioBytes: Uint8Array | undefined,
   jobId: string,
 ): Promise<Uint8Array> {
-  try {
-    const ff = await getFfmpeg();
-    // Let ffmpeg auto-detect the container (works for both MPEG-TS and fMP4).
-    await ff.writeFile("video.bin", videoBytes);
-    if (audioBytes) {
-      await ff.writeFile("audio.bin", audioBytes);
-      await ff.exec([
-        "-i",
-        "video.bin",
-        "-i",
-        "audio.bin",
-        "-c",
-        "copy",
-        "-bsf:a",
-        "aac_adtstoasc",
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
-        "output.mp4",
-      ]);
-    } else {
-      await ff.exec(["-i", "video.bin", "-c", "copy", "-bsf:a", "aac_adtstoasc", "output.mp4"]);
+  const ff = await getFfmpeg();
+  await ff.writeFile("video.bin", videoBytes);
+  if (audioBytes) await ff.writeFile("audio.bin", audioBytes);
+
+  const attempts = audioBytes
+    ? [
+        [
+          "-i", "video.bin",
+          "-i", "audio.bin",
+          "-map", "0:v:0",
+          "-map", "1:a:0",
+          "-c", "copy",
+          "-shortest",
+        ],
+        [
+          "-i", "video.bin",
+          "-i", "audio.bin",
+          "-map", "0:v:0",
+          "-map", "1:a:0",
+          "-c", "copy",
+          "-bsf:a", "aac_adtstoasc",
+          "-shortest",
+        ],
+        [
+          "-fflags", "+genpts",
+          "-i", "video.bin",
+          "-i", "audio.bin",
+          "-map", "0:v:0",
+          "-map", "1:a:0",
+          "-c", "copy",
+          "-shortest",
+        ],
+      ]
+    : [
+        ["-i", "video.bin", "-c", "copy"],
+        ["-i", "video.bin", "-c", "copy", "-bsf:a", "aac_adtstoasc"],
+      ];
+
+  let lastErr: unknown;
+  for (let i = 0; i < attempts.length; i++) {
+    const output = `output-${i}.mp4`;
+    try {
+      const code = await ff.exec([...attempts[i], output]);
+      if (code !== 0) throw new Error(`ffmpeg exited with code ${code}`);
+      const out = await ff.readFile(output);
+      if (typeof out === "string") throw new Error("ffmpeg returned text, expected binary.");
+      return out as Uint8Array;
+    } catch (err) {
+      lastErr = err;
     }
-    const out = await ff.readFile("output.mp4");
-    if (typeof out === "string") throw new Error("ffmpeg returned text, expected binary.");
-    return out as Uint8Array;
-  } catch (err) {
-    // Fallback: ship the raw video bytes so the user at least keeps the data.
+  }
+
+  if (audioBytes) {
+    throw new Error(
+      `Audio was downloaded, but ffmpeg could not mux it with the video: ${(lastErr as Error)?.message ?? "unknown"}`,
+    );
+  }
+
+  try {
     reportProgress({
       jobId,
       phase: "merging",
       ratio: 0.97,
-      message: `Remux failed (${(err as Error).message}); saving raw bytes.`,
+      message: `Video-only remux failed (${(lastErr as Error)?.message ?? "unknown"}); saving raw bytes.`,
     });
+    return videoBytes;
+  } catch {
     return videoBytes;
   }
 }

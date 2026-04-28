@@ -41,6 +41,7 @@ const OFFSCREEN_READY_TIMEOUT_MS = 4_000;
 let streamsByTab: Map<number, DetectedStream[]> = new Map();
 let jobsById: Map<string, PersistedJob> = new Map();
 let armedUntil: Map<number, number> = new Map();
+let focusedCaptureByTab: Map<number, { until: number; streamKey?: string }> = new Map();
 let restored = false;
 let offscreenReady = false;
 let offscreenReadyWaiters: Array<() => void> = [];
@@ -115,13 +116,16 @@ function isArmed(tabId: number): boolean {
   return true;
 }
 
-function armCapture(tabId: number): number {
+function armCapture(tabId: number, focused = false): number {
   const until = Date.now() + CAPTURE_WINDOW_MS;
   armedUntil.set(tabId, until);
+  if (focused) focusedCaptureByTab.set(tabId, { until });
+  else focusedCaptureByTab.delete(tabId);
   void persistArmed();
   setTimeout(() => {
     if (armedUntil.get(tabId) === until) {
       armedUntil.delete(tabId);
+      focusedCaptureByTab.delete(tabId);
       void persistArmed();
       void updateBadge(tabId);
     }
@@ -229,7 +233,7 @@ async function handleContextClick(
         if (tabId != null) {
           streamsByTab.delete(tabId);
           void persistStreams();
-          armCapture(tabId);
+          armCapture(tabId, true);
           void updateBadge(tabId);
         }
         notify(
@@ -269,6 +273,33 @@ async function handleContextClick(
       if (!info.linkUrl) return;
       if (isStreamSegment(info.linkUrl)) {
         notify("This is a media segment, not a standalone playable file. Capture the HLS/DASH manifest instead.");
+        return;
+      }
+      const linkKind = classify(info.linkUrl);
+      if (!linkKind || linkKind === "other") {
+        if (tabId != null) {
+          streamsByTab.delete(tabId);
+          void persistStreams();
+          armCapture(tabId, true);
+          void updateBadge(tabId);
+        }
+        notify(
+          "That link points to a page, not a media file — capture armed for 30s. Play the target video now.",
+        );
+        return;
+      }
+      if (linkKind === "hls" || linkKind === "dash") {
+        const stream: DetectedStream = {
+          id: hashId(info.linkUrl),
+          url: info.linkUrl,
+          kind: linkKind,
+          suggestedName: suggestedFilename(info.linkUrl, linkKind, tab?.title),
+          detectedAt: Date.now(),
+          pageUrl: info.pageUrl,
+          pageTitle: tab?.title,
+          frameId: info.frameId,
+        };
+        await startDownload(stream, `ctx-${Date.now().toString(36)}`, {});
         return;
       }
       try {
@@ -349,6 +380,7 @@ chrome.webRequest.onHeadersReceived.addListener(
       pendingReferers.delete(details.url);
       const tab = await chrome.tabs.get(details.tabId).catch(() => undefined);
       const streamUrl = kind === "hls" ? canonicalHlsMasterUrl(details.url) : details.url;
+      if (!acceptFocusedCaptureStream(details.tabId, kind, streamUrl)) return;
       const stream: DetectedStream = {
         id: hashId(streamUrl),
         url: streamUrl,
@@ -385,6 +417,7 @@ chrome.tabs.onUpdated.addListener((tabId, change) => {
   if (change.status === "loading" && change.url) {
     streamsByTab.delete(tabId);
     armedUntil.delete(tabId);
+    focusedCaptureByTab.delete(tabId);
     void persistStreams();
     void persistArmed();
     void updateBadge(tabId);
@@ -394,6 +427,7 @@ chrome.tabs.onUpdated.addListener((tabId, change) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   streamsByTab.delete(tabId);
   armedUntil.delete(tabId);
+  focusedCaptureByTab.delete(tabId);
   void persistStreams();
   void persistArmed();
 });
@@ -596,6 +630,37 @@ function canonicalHlsMasterUrl(url: string): string {
     return u.toString();
   } catch {
     return url.replace(/_(?:\d+w|audio)\.m3u8(\?|$|#)/i, ".m3u8$1");
+  }
+}
+
+function acceptFocusedCaptureStream(
+  tabId: number,
+  kind: DetectedStream["kind"],
+  streamUrl: string,
+): boolean {
+  const focused = focusedCaptureByTab.get(tabId);
+  if (!focused) return true;
+  if (focused.until < Date.now()) {
+    focusedCaptureByTab.delete(tabId);
+    return true;
+  }
+
+  const key = streamGroupKey(kind, streamUrl);
+  if (!focused.streamKey) {
+    focused.streamKey = key;
+    focusedCaptureByTab.set(tabId, focused);
+    return true;
+  }
+  return focused.streamKey === key;
+}
+
+function streamGroupKey(kind: DetectedStream["kind"], streamUrl: string): string {
+  if (kind !== "hls") return `${kind}:${streamUrl}`;
+  try {
+    const u = new URL(canonicalHlsMasterUrl(streamUrl));
+    return `hls:${u.origin}${u.pathname}`;
+  } catch {
+    return `hls:${canonicalHlsMasterUrl(streamUrl).split("?")[0].split("#")[0]}`;
   }
 }
 
