@@ -1,17 +1,17 @@
 {
-  "name": "@my-blog/plugins",
+  "name": "@tasty-rice/plugins",
   "private": true,
   "version": "0.0.0",
   "description": "Workspace for self-published browser extensions, desktop addons and small utilities surfaced on the /apps page.",
   "workspaces": [
-    "*"
+    "packages/*"
   ],
   "scripts": {
     "build": "npm run --workspaces --if-present build",
-    "dev": "echo 'Pick a plugin: cd <plugin>/ && npm run dev'",
+    "dev": "echo 'Pick a plugin: cd packages/<plugin>/ && npm run dev'",
     "type-check": "npm run --workspaces --if-present type-check",
     "lint": "npm run --workspaces --if-present lint",
-    "clean": "rm -rf */dist */node_modules"
+    "clean": "rm -rf packages/*/dist packages/*/node_modules node_modules"
   },
   "devDependencies": {
     "typescript": "^5.5.4"

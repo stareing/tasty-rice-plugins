@@ -7,11 +7,11 @@ node_modules/
 .yarn/build-state.log
 .yarn/install-state.gz
 
-# Build output (per-plugin)
-*/dist/
-*/dist.zip
-*/.vite/
-*/.turbo/
+# Build output (per-plugin, depth-agnostic so it covers packages/<slug>/dist)
+**/dist/
+**/dist.zip
+**/.vite/
+**/.turbo/
 
 # Logs
 *.log
