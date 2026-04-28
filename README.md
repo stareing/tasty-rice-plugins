@@ -46,7 +46,9 @@ From this directory:
 npm install                  # installs all plugins via workspaces
 npm run build                # build every plugin (skipped if no `build` script)
 npm run type-check           # type-check every plugin
-npm run clean                # rm -rf dist/ + node_modules/ across plugins
+npm run release:local        # build + pack release zips into dist-release/
+npm run release:pack         # pack only (assumes build already ran)
+npm run clean                # rm -rf dist/ + node_modules/ + dist-release/
 ```
 
 From a single plugin:
@@ -56,6 +58,24 @@ cd packages/media-stream-grabber/
 npm run dev                  # plugin-specific dev server
 npm run build                # plugin-specific production build
 ```
+
+## Release flow (GitHub Actions)
+
+Releases are fully automated. To cut a new version of any plugin:
+
+1. Bump the plugin's `package.json` `version` (e.g. `packages/media-stream-grabber/package.json`).
+2. Commit and tag: `git tag v0.1.1 && git push origin main --tags`.
+3. The `Release` workflow builds every plugin, packs each `dist/` into a ZIP,
+   and creates a GitHub Release with the assets attached.
+
+Each release publishes two assets per plugin:
+
+- `<slug>-v<version>.zip` — versioned, immutable.
+- `<slug>.zip` — unversioned alias, so users can always grab the latest from
+  `https://github.com/stareing/tasty-rice-plugins/releases/latest/download/<slug>.zip`.
+
+The `CI` workflow runs `type-check` + `build` on every push and PR to keep
+`main` green between releases.
 
 ## Adding a new plugin
 

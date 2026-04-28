@@ -13,6 +13,9 @@ node_modules/
 **/.vite/
 **/.turbo/
 
+# Release script output (at workspace root only)
+/dist-release/
+
 # Logs
 *.log
 npm-debug.log*

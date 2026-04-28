@@ -43,6 +43,20 @@ npm run build        # Type-check + production bundle in dist/
 npm run zip          # (optional) produce a .zip for the Chrome Web Store
 ```
 
+## Install (end users)
+
+The fastest path that doesn't require a Chrome Web Store listing:
+
+1. Grab the latest release ZIP:
+   <https://github.com/stareing/tasty-rice-plugins/releases/latest/download/media-stream-grabber.zip>
+2. Unzip it anywhere on disk.
+3. Open `chrome://extensions`, turn on **Developer mode** (top-right toggle).
+4. Click **Load unpacked** and pick the unzipped folder.
+
+To upgrade later, download the new ZIP, point "Load unpacked" at the new
+folder, or hit the refresh icon on the extension card. Chrome treats this as
+a normal extension — popup, context menus, badge counts and all.
+
 ## What it currently handles
 
 | Source                                  | Status                                 |
