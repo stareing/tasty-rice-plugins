@@ -29,6 +29,7 @@ import type {
 import { classify, hashId, suggestedFilename } from "@/lib/streamClassify";
 
 const STREAM_SEGMENT_RE = /\.(ts|m4s|cmfv|cmfa|mp4v|mp4a)(\?|$|#)/i;
+const HLS_CHILD_PLAYLIST_RE = /_(?:\d+w|audio)\.m3u8(\?|$|#)/i;
 const MAX_STREAMS_PER_TAB = 64;
 const SESSION_KEY = "msg.streamsByTab.v1";
 const JOBS_KEY = "msg.jobs.v1";
@@ -226,6 +227,8 @@ async function handleContextClick(
       // so the player's manifest fetches become visible.
       if (!url || url.startsWith("blob:") || url.startsWith("data:")) {
         if (tabId != null) {
+          streamsByTab.delete(tabId);
+          void persistStreams();
           armCapture(tabId);
           void updateBadge(tabId);
         }
@@ -345,11 +348,12 @@ chrome.webRequest.onHeadersReceived.addListener(
       const refererEntry = pendingReferers.get(details.url);
       pendingReferers.delete(details.url);
       const tab = await chrome.tabs.get(details.tabId).catch(() => undefined);
+      const streamUrl = kind === "hls" ? canonicalHlsMasterUrl(details.url) : details.url;
       const stream: DetectedStream = {
-        id: hashId(details.url),
-        url: details.url,
+        id: hashId(streamUrl),
+        url: streamUrl,
         kind,
-        suggestedName: suggestedFilename(details.url, kind, tab?.title),
+        suggestedName: suggestedFilename(streamUrl, kind, tab?.title),
         mimeType: contentType,
         detectedAt: Date.now(),
         pageUrl: tab?.url,
@@ -582,6 +586,17 @@ async function dropJob(jobId: string): Promise<void> {
 
 function isStreamSegment(url: string): boolean {
   return STREAM_SEGMENT_RE.test(url.split("#")[0]);
+}
+
+function canonicalHlsMasterUrl(url: string): string {
+  if (!HLS_CHILD_PLAYLIST_RE.test(url)) return url;
+  try {
+    const u = new URL(url);
+    u.pathname = u.pathname.replace(/_(?:\d+w|audio)\.m3u8$/i, ".m3u8");
+    return u.toString();
+  } catch {
+    return url.replace(/_(?:\d+w|audio)\.m3u8(\?|$|#)/i, ".m3u8$1");
+  }
 }
 
 /* --------------------------- DNR Referer rules ---------------------------- */

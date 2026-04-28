@@ -43,6 +43,7 @@ const IDB_STORE = "buffers";
 const DASH_KEY_PREFIX = "dash::";
 const DASH_AUDIO_PREFIX = "dash-audio::";
 const DASH_TEXT_PREFIX = "dash-text::";
+const HLS_CHILD_PLAYLIST_RE = /_(?:\d+w|audio)\.m3u8(\?|$|#)/i;
 
 chrome.runtime.onMessage.addListener((msg: RuntimeMessage, _sender, sendResponse) => {
   if (msg.target !== "offscreen") return false;
@@ -418,8 +419,8 @@ async function runDownloadHls(
 ): Promise<void> {
   reportProgress({ jobId, phase: "fetching-playlist", ratio: 0, message: "Fetching playlist…" });
 
-  const masterText = await fetchText(stream.url);
-  const masterParsed = parseM3U8(masterText, stream.url);
+  const masterSource = await fetchCanonicalHls(stream.url);
+  const masterParsed = parseM3U8(masterSource.text, masterSource.url);
 
   let videoPlaylistUrl: string;
   let audioRendition: HlsRendition | undefined;
@@ -452,14 +453,13 @@ async function runDownloadHls(
   let audioSegments: HlsSegment[] | undefined;
   let audioInit: Uint8Array | undefined;
   if (audioRendition?.uri) {
-    const aText = await fetchText(audioRendition.uri);
-    const aParsed = parseM3U8(aText, audioRendition.uri);
-    if (aParsed.kind === "media") {
-      audioSegments = aParsed.playlist.segments;
-      if (aParsed.playlist.initSegment) {
-        audioInit = await fetchInitSegment(aParsed.playlist.initSegment);
-      }
-    }
+    const audio = await fetchHlsAudioPlaylist(audioRendition.uri);
+    audioSegments = audio?.segments;
+    audioInit = audio?.init;
+  } else {
+    const audio = await fetchHlsAudioPlaylist(deriveSiblingAudioPlaylistUrl(videoPlaylistUrl));
+    audioSegments = audio?.segments;
+    audioInit = audio?.init;
   }
 
   const keyCache = await resolveKeys([
@@ -485,6 +485,57 @@ async function runDownloadHls(
     await downloadSubtitleHls(stream, masterParsed.renditions, selection.subtitleId).catch(
       (err) => reportSubtitleError(jobId, err),
     );
+  }
+}
+
+function canonicalHlsMasterUrl(url: string): string {
+  if (!HLS_CHILD_PLAYLIST_RE.test(url)) return url;
+  try {
+    const u = new URL(url);
+    u.pathname = u.pathname.replace(/_(?:\d+w|audio)\.m3u8$/i, ".m3u8");
+    return u.toString();
+  } catch {
+    return url.replace(/_(?:\d+w|audio)\.m3u8(\?|$|#)/i, ".m3u8$1");
+  }
+}
+
+async function fetchCanonicalHls(url: string): Promise<{ url: string; text: string }> {
+  const masterUrl = canonicalHlsMasterUrl(url);
+  if (masterUrl !== url) {
+    try {
+      return { url: masterUrl, text: await fetchText(masterUrl) };
+    } catch {
+      /* fall back to the exact sniffed playlist */
+    }
+  }
+  return { url, text: await fetchText(url) };
+}
+
+function deriveSiblingAudioPlaylistUrl(videoPlaylistUrl: string): string | undefined {
+  if (!/_(?:\d+w)\.m3u8(\?|$|#)/i.test(videoPlaylistUrl)) return undefined;
+  try {
+    const u = new URL(videoPlaylistUrl);
+    u.pathname = u.pathname.replace(/_\d+w\.m3u8$/i, "_audio.m3u8");
+    return u.toString();
+  } catch {
+    return videoPlaylistUrl.replace(/_\d+w\.m3u8(\?|$|#)/i, "_audio.m3u8$1");
+  }
+}
+
+async function fetchHlsAudioPlaylist(
+  url: string | undefined,
+): Promise<{ segments: HlsSegment[]; init?: Uint8Array } | undefined> {
+  if (!url) return undefined;
+  try {
+    const text = await fetchText(url);
+    const parsed = parseM3U8(text, url);
+    if (parsed.kind !== "media" || !parsed.playlist.segments.length) return undefined;
+    const init = parsed.playlist.initSegment
+      ? await fetchInitSegment(parsed.playlist.initSegment)
+      : undefined;
+    return { segments: parsed.playlist.segments, init };
+  } catch {
+    return undefined;
   }
 }
 
