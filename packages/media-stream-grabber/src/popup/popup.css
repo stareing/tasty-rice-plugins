@@ -176,3 +176,133 @@ body {
 
 .progress__label--error { color: var(--danger); }
 .progress__label--done { color: var(--ok); }
+
+/* ------------------------------- modal ------------------------------- */
+
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.55);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 16px;
+  z-index: 100;
+  backdrop-filter: blur(2px);
+}
+
+.modal__panel {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  width: 100%;
+  padding: 14px;
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.18);
+}
+
+.modal__title {
+  font-size: 13px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.modal__sub {
+  font-size: 11px;
+  color: var(--muted);
+  margin: 0 0 10px;
+  word-break: break-all;
+  max-height: 36px;
+  overflow: hidden;
+}
+
+.modal__probing {
+  padding: 24px 0;
+  text-align: center;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.modal__section {
+  margin-bottom: 10px;
+}
+
+.modal__label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.modal__list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+.row:hover {
+  border-color: var(--accent);
+}
+.row--selected {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--card));
+}
+.row__main {
+  flex: 1;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.row__pill {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 1px 5px;
+  margin-left: 6px;
+}
+
+.modal__actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+.modal__actions button {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.modal__actions button.primary {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: var(--accent);
+}
+.modal__actions button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

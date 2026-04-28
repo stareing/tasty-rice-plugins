@@ -6,6 +6,9 @@ const VIDEO_EXT = /\.(mp4|m4v|mkv|webm|mov|ts|flv)(\?|$|#)/i;
 const AUDIO_EXT = /\.(mp3|m4a|aac|ogg|opus|flac|wav)(\?|$|#)/i;
 const IMAGE_EXT = /\.(jpe?g|png|gif|webp|avif|bmp|svg)(\?|$|#)/i;
 
+const FILENAME_FORBIDDEN = /[\\/:*?"<>|]+/g;
+const FILENAME_TRIM = /^[.\s]+|[.\s]+$/g;
+
 /** Classify a request by URL + Content-Type. Returns null when it is not media. */
 export function classify(url: string, contentType?: string): StreamKind | null {
   const ct = (contentType || "").toLowerCase();
@@ -21,16 +24,50 @@ export function classify(url: string, contentType?: string): StreamKind | null {
   return null;
 }
 
-export function suggestedFilename(url: string, kind: StreamKind): string {
+export function slugify(input: string, max = 80): string {
+  const cleaned = input
+    .replace(FILENAME_FORBIDDEN, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(FILENAME_TRIM, "");
+  return cleaned.slice(0, max);
+}
+
+function urlBasename(url: string): string {
   try {
     const u = new URL(url);
-    const last = u.pathname.split("/").filter(Boolean).pop() || "stream";
-    const stripped = last.replace(/\.(m3u8|mpd)$/i, "");
-    if (kind === "hls" || kind === "dash") return `${stripped || "stream"}.mp4`;
+    const last = u.pathname.split("/").filter(Boolean).pop() || "";
     return last;
   } catch {
-    return "stream";
+    return "";
   }
+}
+
+function extensionFor(kind: StreamKind, fallbackUrl: string): string {
+  if (kind === "hls" || kind === "dash") return ".mp4";
+  const base = urlBasename(fallbackUrl);
+  const m = /\.([a-z0-9]{1,5})(\?|$|#)/i.exec(base);
+  return m ? `.${m[1].toLowerCase()}` : "";
+}
+
+/**
+ * Build a sane filename. Prefer the page title (slugified) so the user sees
+ * a meaningful name; fall back to the URL basename. HLS / DASH always end .mp4.
+ */
+export function suggestedFilename(
+  url: string,
+  kind: StreamKind,
+  pageTitle?: string,
+): string {
+  const ext = extensionFor(kind, url);
+  if (pageTitle) {
+    const slug = slugify(pageTitle);
+    if (slug) return ext && !slug.toLowerCase().endsWith(ext) ? `${slug}${ext}` : slug;
+  }
+  const base = urlBasename(url) || "stream";
+  const stripped = base.replace(/\.(m3u8|mpd)(\?.*)?$/i, "");
+  const slug = slugify(stripped) || "stream";
+  return ext && !slug.toLowerCase().endsWith(ext) ? `${slug}${ext}` : slug;
 }
 
 /** djb2 hash → base36; cheap, no crypto needed. */

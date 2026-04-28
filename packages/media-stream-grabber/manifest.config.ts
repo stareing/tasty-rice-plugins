@@ -43,6 +43,7 @@ export default defineManifest({
     "offscreen",
     "contextMenus",
     "notifications",
+    "declarativeNetRequestWithHostAccess",
   ],
   host_permissions: ["<all_urls>"],
   // SharedArrayBuffer (needed by ffmpeg.wasm) requires cross-origin isolation.
