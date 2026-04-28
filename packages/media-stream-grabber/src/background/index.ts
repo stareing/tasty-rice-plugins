@@ -1,18 +1,24 @@
 /**
  * Background service worker.
  *
- * Responsibilities:
- *   1. Sniff `webRequest` for media URLs and bucket them per-tab + frame.
- *   2. Maintain a small in-memory store keyed by tabId — service workers can
- *      be evicted, so the store is also persisted to chrome.storage.session.
- *   3. Maintain a dynamic right-click menu listing every detected stream on
- *      the current tab so the user can download a specific resource without
- *      ever opening the popup.
- *   4. Inject a temporary `Referer` header (via declarativeNetRequest) for the
- *      duration of an HLS download so segment CDNs don't 403.
- *   5. Spawn / re-attach the offscreen document for ffmpeg.wasm work and
- *      shuttle messages with a `target` discriminator so SW and offscreen
- *      don't both react to the same broadcast.
+ * Sniffer policy: NO global capture by default. The webRequest listeners are
+ * registered (MV3 forces top-level registration) but every callback bails
+ * unless the request's tab is in an "armed" window — armed windows are
+ * created exclusively by the right-click menu. This is the privacy contract:
+ * the extension does not silently observe pages the user has not opted in to.
+ *
+ * The right-click menu offers two affordances:
+ *   1. Direct: "Download this video / audio / image / link target". When the
+ *      element exposes a usable srcUrl/linkUrl, we download it (or queue an
+ *      HLS/DASH job) without ever arming the sniffer.
+ *   2. Arm: "Capture next 30s of media on this tab". Used when the player
+ *      lives behind a blob:/MSE source — we open a short capture window so
+ *      manifest fetches in that one tab become visible.
+ *
+ * The cross-context bus uses the `target: "sw" | "offscreen"` discriminator
+ * (see CLAUDE.md). The SW also waits for an `offscreen:ready` handshake
+ * before forwarding messages, so freshly-created offscreen documents never
+ * see the "Receiving end does not exist" race.
  */
 
 import type {
@@ -25,19 +31,23 @@ import { classify, hashId, suggestedFilename } from "@/lib/streamClassify";
 const MAX_STREAMS_PER_TAB = 64;
 const SESSION_KEY = "msg.streamsByTab.v1";
 const JOBS_KEY = "msg.jobs.v1";
+const ARMED_KEY = "msg.armedUntil.v1";
 const DNR_RULE_BASE = 9000;
+const CAPTURE_WINDOW_MS = 30_000;
+const OFFSCREEN_READY_TIMEOUT_MS = 4_000;
 
-/** Per-tab map. Reloaded from chrome.storage.session on SW wake. */
 let streamsByTab: Map<number, DetectedStream[]> = new Map();
 let jobsById: Map<string, PersistedJob> = new Map();
+let armedUntil: Map<number, number> = new Map();
 let restored = false;
-let menuRebuildTimer: ReturnType<typeof setTimeout> | null = null;
+let offscreenReady = false;
+let offscreenReadyWaiters: Array<() => void> = [];
 
 async function restoreFromSession(): Promise<void> {
   if (restored) return;
   restored = true;
   try {
-    const data = await chrome.storage.session.get([SESSION_KEY, JOBS_KEY]);
+    const data = await chrome.storage.session.get([SESSION_KEY, JOBS_KEY, ARMED_KEY]);
     const rawStreams = data[SESSION_KEY] as Record<string, DetectedStream[]> | undefined;
     if (rawStreams) {
       streamsByTab = new Map(
@@ -48,8 +58,17 @@ async function restoreFromSession(): Promise<void> {
     if (rawJobs) {
       jobsById = new Map(Object.entries(rawJobs));
     }
+    const rawArmed = data[ARMED_KEY] as Record<string, number> | undefined;
+    if (rawArmed) {
+      const now = Date.now();
+      armedUntil = new Map(
+        Object.entries(rawArmed)
+          .map(([k, v]) => [Number(k), Number(v)] as [number, number])
+          .filter(([, until]) => until > now),
+      );
+    }
   } catch {
-    // session storage may be unavailable in older Chromes — non-fatal.
+    /* session storage unavailable — non-fatal */
   }
 }
 
@@ -73,6 +92,41 @@ async function persistJobs(): Promise<void> {
   }
 }
 
+async function persistArmed(): Promise<void> {
+  const obj: Record<string, number> = {};
+  for (const [k, v] of armedUntil) obj[String(k)] = v;
+  try {
+    await chrome.storage.session.set({ [ARMED_KEY]: obj });
+  } catch {
+    /* ignore */
+  }
+}
+
+function isArmed(tabId: number): boolean {
+  const until = armedUntil.get(tabId);
+  if (!until) return false;
+  if (until < Date.now()) {
+    armedUntil.delete(tabId);
+    void persistArmed();
+    return false;
+  }
+  return true;
+}
+
+function armCapture(tabId: number): number {
+  const until = Date.now() + CAPTURE_WINDOW_MS;
+  armedUntil.set(tabId, until);
+  void persistArmed();
+  setTimeout(() => {
+    if (armedUntil.get(tabId) === until) {
+      armedUntil.delete(tabId);
+      void persistArmed();
+      void updateBadge(tabId);
+    }
+  }, CAPTURE_WINDOW_MS + 250);
+  return until;
+}
+
 function addStream(tabId: number, stream: DetectedStream): boolean {
   const list = streamsByTab.get(tabId) ?? [];
   if (list.some((s) => s.id === stream.id)) return false;
@@ -81,28 +135,14 @@ function addStream(tabId: number, stream: DetectedStream): boolean {
   return true;
 }
 
-function activeTab(): Promise<chrome.tabs.Tab | undefined> {
-  return chrome.tabs
-    .query({ active: true, lastFocusedWindow: true })
-    .then((tabs) => tabs[0])
-    .catch(() => undefined);
-}
-
 /* ------------------------------ context menus ----------------------------- */
-//
-// Static items live for the SW lifetime. Dynamic items (one per detected
-// stream on the active tab) are rebuilt whenever the active tab's stream
-// list changes; we track their ids so we only remove what we created.
 
 const MENU_PARENT = "msg.parent";
+const MENU_ARM = "msg.arm";
 const MENU_VIDEO = "msg.download-video";
 const MENU_AUDIO = "msg.download-audio";
 const MENU_LINK = "msg.download-link";
 const MENU_IMAGE = "msg.download-image";
-const MENU_EMPTY = "msg.empty";
-const DYNAMIC_PREFIX = "msg.dyn.";
-
-const dynamicIds: Set<string> = new Set();
 
 chrome.runtime.onInstalled.addListener(() => {
   void rebuildStaticMenus();
@@ -113,11 +153,16 @@ chrome.runtime.onStartup.addListener(() => {
 
 async function rebuildStaticMenus(): Promise<void> {
   await new Promise<void>((resolve) => chrome.contextMenus.removeAll(resolve));
-  dynamicIds.clear();
   chrome.contextMenus.create({
     id: MENU_PARENT,
     title: "Media Stream Grabber",
     contexts: ["page", "frame", "video", "audio", "image", "link"],
+  });
+  chrome.contextMenus.create({
+    id: MENU_ARM,
+    parentId: MENU_PARENT,
+    title: `Capture next ${CAPTURE_WINDOW_MS / 1000}s of media on this tab`,
+    contexts: ["page", "frame", "video", "audio"],
   });
   chrome.contextMenus.create({
     id: MENU_VIDEO,
@@ -143,93 +188,6 @@ async function rebuildStaticMenus(): Promise<void> {
     title: "Download link target",
     contexts: ["link"],
   });
-  // Placeholder shown when nothing has been sniffed yet on the current tab.
-  chrome.contextMenus.create({
-    id: MENU_EMPTY,
-    parentId: MENU_PARENT,
-    title: "No streams sniffed on this tab",
-    enabled: false,
-    contexts: ["page", "frame", "video", "audio"],
-  });
-  // Repopulate dynamic items for the currently active tab.
-  void scheduleDynamicRebuild();
-}
-
-function scheduleDynamicRebuild(): void {
-  if (menuRebuildTimer) clearTimeout(menuRebuildTimer);
-  menuRebuildTimer = setTimeout(() => {
-    menuRebuildTimer = null;
-    void rebuildDynamicMenus();
-  }, 80);
-}
-
-async function rebuildDynamicMenus(): Promise<void> {
-  await restoreFromSession();
-  const tab = await activeTab();
-  const list = tab?.id != null ? streamsByTab.get(tab.id) ?? [] : [];
-
-  // Wipe previous dynamic items.
-  for (const id of dynamicIds) {
-    await new Promise<void>((resolve) =>
-      chrome.contextMenus.remove(id, () => {
-        // ignore "no such id" errors during races
-        void chrome.runtime.lastError;
-        resolve();
-      }),
-    );
-  }
-  dynamicIds.clear();
-
-  // Toggle the empty placeholder vs a real list.
-  await new Promise<void>((resolve) =>
-    chrome.contextMenus.update(
-      MENU_EMPTY,
-      { visible: list.length === 0 },
-      () => {
-        void chrome.runtime.lastError;
-        resolve();
-      },
-    ),
-  );
-
-  if (!list.length) return;
-
-  // Cap dynamic items so the right-click menu doesn't span the screen.
-  const visible = list.slice(0, 12);
-  for (const s of visible) {
-    const id = `${DYNAMIC_PREFIX}${s.id}`;
-    const title = formatMenuTitle(s);
-    try {
-      chrome.contextMenus.create({
-        id,
-        parentId: MENU_PARENT,
-        title,
-        contexts: ["page", "frame", "video", "audio", "image", "link"],
-      });
-      dynamicIds.add(id);
-    } catch {
-      // duplicate id (race) — fine
-    }
-  }
-  if (list.length > visible.length) {
-    const id = `${DYNAMIC_PREFIX}__more`;
-    chrome.contextMenus.create({
-      id,
-      parentId: MENU_PARENT,
-      title: `… ${list.length - visible.length} more — open the popup`,
-      contexts: ["page", "frame", "video", "audio"],
-      enabled: false,
-    });
-    dynamicIds.add(id);
-  }
-}
-
-function formatMenuTitle(s: DetectedStream): string {
-  const parts: string[] = [];
-  parts.push(s.kind.toUpperCase());
-  if (s.suggestedName) parts.push(s.suggestedName);
-  const url = s.url.length > 60 ? `${s.url.slice(0, 57)}…` : s.url;
-  return `${parts.join(" · ")}  ${url}`;
 }
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
@@ -242,34 +200,48 @@ async function handleContextClick(
 ): Promise<void> {
   await restoreFromSession();
   const id = String(info.menuItemId);
-
-  // Dynamic stream item: download it directly without going through the popup.
-  if (id.startsWith(DYNAMIC_PREFIX) && id !== `${DYNAMIC_PREFIX}__more`) {
-    const streamId = id.slice(DYNAMIC_PREFIX.length);
-    const list = tab?.id != null ? streamsByTab.get(tab.id) ?? [] : [];
-    const stream = list.find((s) => s.id === streamId);
-    if (!stream) return notify("Stream is no longer available — reload and try again.");
-    await startDownload(stream, `ctx-${Date.now().toString(36)}`, {});
-    return;
-  }
+  const tabId = tab?.id;
 
   switch (id) {
+    case MENU_ARM: {
+      if (tabId == null) return;
+      const until = armCapture(tabId);
+      void updateBadge(tabId);
+      void chrome.runtime
+        .sendMessage({ type: "capture:status", tabId, armedUntil: until, target: "sw" } satisfies RuntimeMessage)
+        .catch(() => {
+          /* popup closed — fine */
+        });
+      notify(
+        `Capturing media on this tab for ${CAPTURE_WINDOW_MS / 1000}s — start playback now.`,
+      );
+      return;
+    }
     case MENU_VIDEO:
     case MENU_AUDIO:
     case MENU_IMAGE: {
       const url = info.srcUrl;
-      // blob: / MSE players expose a blob URL that is unusable cross-context.
-      // Fall back to whatever was sniffed for this exact frame.
-      if (!url || url.startsWith("blob:")) {
-        return downloadBestForFrame(tab?.id, info.frameId);
+      // blob:/MSE players can't be downloaded by URL; arm the capture window
+      // so the player's manifest fetches become visible.
+      if (!url || url.startsWith("blob:") || url.startsWith("data:")) {
+        if (tabId != null) {
+          armCapture(tabId);
+          void updateBadge(tabId);
+        }
+        notify(
+          "This element uses an in-memory source — capture window armed for 30s. Restart playback to surface the manifest.",
+        );
+        return;
       }
-      // HLS playlist → merge pipeline.
-      if (/\.m3u8(\?|$|#)/i.test(url)) {
+      // HLS / DASH playlists go through the merge pipeline; everything else
+      // is a direct browser download.
+      if (/\.m3u8(\?|$|#)/i.test(url) || /\.mpd(\?|$|#)/i.test(url)) {
+        const kind: DetectedStream["kind"] = /\.mpd(\?|$|#)/i.test(url) ? "dash" : "hls";
         const stream: DetectedStream = {
           id: hashId(url),
           url,
-          kind: "hls",
-          suggestedName: suggestedFilename(url, "hls", tab?.title),
+          kind,
+          suggestedName: suggestedFilename(url, kind, tab?.title),
           detectedAt: Date.now(),
           pageUrl: info.pageUrl,
           pageTitle: tab?.title,
@@ -297,31 +269,6 @@ async function handleContextClick(
   }
 }
 
-async function downloadBestForFrame(
-  tabId: number | undefined,
-  frameId: number | undefined,
-): Promise<void> {
-  if (tabId == null) return;
-  const list = streamsByTab.get(tabId) ?? [];
-  if (!list.length) return notify("No streams sniffed on this tab yet — start playing the video first.");
-  // Prefer a stream from the same frame the user clicked in.
-  const fromFrame = frameId != null ? list.filter((s) => s.frameId === frameId) : [];
-  const candidates = fromFrame.length ? fromFrame : list;
-  const KIND_PRIORITY: Record<DetectedStream["kind"], number> = {
-    hls: 0,
-    dash: 1,
-    mp4: 2,
-    audio: 3,
-    image: 4,
-    other: 5,
-  };
-  candidates.sort(
-    (a, b) =>
-      KIND_PRIORITY[a.kind] - KIND_PRIORITY[b.kind] || b.detectedAt - a.detectedAt,
-  );
-  await startDownload(candidates[0], `ctx-${Date.now().toString(36)}`, {});
-}
-
 function notify(message: string): void {
   try {
     void chrome.notifications.create({
@@ -336,6 +283,11 @@ function notify(message: string): void {
 }
 
 /* --------------------------- webRequest sniffer --------------------------- */
+//
+// Listeners are always registered, but every callback returns immediately
+// unless the request's tab has been armed via the right-click menu. The
+// "armed" set is the only thing standing between us and the previous
+// behaviour of capturing every media URL across every site.
 
 const headerLookup = (
   headers: chrome.webRequest.HttpHeader[] | undefined,
@@ -349,18 +301,17 @@ const headerLookup = (
   return undefined;
 };
 
+const pendingReferers = new Map<string, { referer: string; frameId: number }>();
+
 chrome.webRequest.onSendHeaders.addListener(
   (details) => {
     if (details.tabId < 0) return;
     if (details.method !== "GET") return;
+    if (!isArmed(details.tabId)) return;
     const referer = headerLookup(details.requestHeaders, "referer");
     if (!referer) return;
-    // Stash the referer keyed by URL so the sniffer can attach it when the
-    // headers come back. webRequest doesn't give us request headers and
-    // response headers in the same callback.
     pendingReferers.set(details.url, { referer, frameId: details.frameId });
     if (pendingReferers.size > 256) {
-      // Bound the map — first entry is oldest in insertion order.
       const oldest = pendingReferers.keys().next().value;
       if (oldest) pendingReferers.delete(oldest);
     }
@@ -369,18 +320,15 @@ chrome.webRequest.onSendHeaders.addListener(
   ["requestHeaders", "extraHeaders"],
 );
 
-const pendingReferers = new Map<string, { referer: string; frameId: number }>();
-
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
     if (details.tabId < 0) return;
     if (details.method !== "GET") return;
+    if (!isArmed(details.tabId)) return;
 
     const contentType = headerLookup(details.responseHeaders, "content-type");
     const kind = classify(details.url, contentType);
     if (!kind) return;
-
-    // Skip the noisy stuff: HLS sub-segments (.ts) and image thumbnails.
     if (kind === "mp4" && /\.ts(\?|$|#)/i.test(details.url)) return;
     if (kind === "image") return;
 
@@ -411,50 +359,44 @@ chrome.webRequest.onHeadersReceived.addListener(
           target: "sw",
         } satisfies RuntimeMessage)
         .catch(() => {
-          /* popup not open — fine */
+          /* popup closed — fine */
         });
       void updateBadge(details.tabId);
-      scheduleDynamicRebuild();
     });
   },
   { urls: ["<all_urls>"] },
   ["responseHeaders"],
 );
 
-chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
+chrome.tabs.onUpdated.addListener((tabId, change) => {
   if (change.status === "loading" && change.url) {
     streamsByTab.delete(tabId);
+    armedUntil.delete(tabId);
     void persistStreams();
+    void persistArmed();
     void updateBadge(tabId);
-    scheduleDynamicRebuild();
-    return;
-  }
-  if (change.title || change.url) {
-    const list = streamsByTab.get(tabId);
-    if (!list?.length) return;
-    for (const s of list) {
-      if (!s.pageUrl && tab.url) s.pageUrl = tab.url;
-      if (!s.pageTitle && tab.title) s.pageTitle = tab.title;
-    }
-    void persistStreams();
   }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   streamsByTab.delete(tabId);
+  armedUntil.delete(tabId);
   void persistStreams();
-  scheduleDynamicRebuild();
-});
-
-chrome.tabs.onActivated.addListener(() => {
-  scheduleDynamicRebuild();
+  void persistArmed();
 });
 
 async function updateBadge(tabId: number): Promise<void> {
   const count = streamsByTab.get(tabId)?.length ?? 0;
+  const armed = isArmed(tabId);
   try {
-    await chrome.action.setBadgeText({ tabId, text: count > 0 ? String(count) : "" });
-    await chrome.action.setBadgeBackgroundColor({ tabId, color: "#2563eb" });
+    await chrome.action.setBadgeText({
+      tabId,
+      text: count > 0 ? String(count) : armed ? "•" : "",
+    });
+    await chrome.action.setBadgeBackgroundColor({
+      tabId,
+      color: armed ? "#dc2626" : "#2563eb",
+    });
   } catch {
     /* tab gone */
   }
@@ -469,6 +411,14 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, sender, sendResponse)
     await restoreFromSession();
 
     switch (msg.type) {
+      case "offscreen:ready": {
+        offscreenReady = true;
+        const waiters = offscreenReadyWaiters;
+        offscreenReadyWaiters = [];
+        for (const w of waiters) w();
+        sendResponse({ ok: true });
+        return;
+      }
       case "streams:list": {
         const streams = streamsByTab.get(msg.tabId) ?? [];
         sendResponse({
@@ -482,60 +432,30 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, sender, sendResponse)
         streamsByTab.delete(msg.tabId);
         await persistStreams();
         await updateBadge(msg.tabId);
-        scheduleDynamicRebuild();
         sendResponse({ ok: true });
         return;
       }
-      case "streams:report-direct": {
-        // Content script picked up a <video src=...> the SW couldn't see.
-        // Fill in the bits only the SW knows.
-        const tabId = sender.tab?.id;
-        if (tabId == null) {
-          sendResponse({ ok: false, error: "no tab" });
-          return;
-        }
-        if (msg.url.startsWith("blob:") || msg.url.startsWith("data:")) {
-          sendResponse({ ok: true, ignored: true });
-          return;
-        }
-        const kind = classify(msg.url) ?? "other";
-        if (kind === "image" || kind === "other") {
-          sendResponse({ ok: true, ignored: true });
-          return;
-        }
-        const stream: DetectedStream = {
-          id: hashId(msg.url),
-          url: msg.url,
-          kind,
-          suggestedName: suggestedFilename(msg.url, kind, msg.pageTitle),
-          pageUrl: msg.pageUrl,
-          pageTitle: msg.pageTitle,
-          frameId: sender.frameId,
-          detectedAt: Date.now(),
-        };
-        if (addStream(tabId, stream)) {
-          await persistStreams();
-          void updateBadge(tabId);
-          scheduleDynamicRebuild();
-          void chrome.runtime
-            .sendMessage({
-              type: "streams:added",
-              tabId,
-              stream,
-              target: "sw",
-            } satisfies RuntimeMessage)
-            .catch(() => {
-              /* popup not open */
-            });
-        }
-        sendResponse({ ok: true });
+      case "capture:arm": {
+        const until = armCapture(msg.tabId);
+        await updateBadge(msg.tabId);
+        sendResponse({
+          type: "capture:status",
+          tabId: msg.tabId,
+          armedUntil: until,
+          target: "sw",
+        } satisfies RuntimeMessage);
         return;
       }
       case "download:probe": {
         try {
           await ensureOffscreen();
-          const fwd: RuntimeMessage = { ...msg, target: "offscreen" };
-          await chrome.runtime.sendMessage(fwd);
+          await waitForOffscreenReady();
+          await chrome.runtime
+            .sendMessage({ ...msg, target: "offscreen" } satisfies RuntimeMessage)
+            .catch(() => {
+              /* offscreen has the listener; if Chrome still races, the user
+                 will retry from the popup. */
+            });
           sendResponse({ ok: true });
         } catch (err) {
           sendResponse({ ok: false, error: (err as Error).message });
@@ -555,14 +475,13 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, sender, sendResponse)
         await chrome.runtime
           .sendMessage({ ...msg, target: "offscreen" } satisfies RuntimeMessage)
           .catch(() => {
-            /* offscreen not alive */
+            /* offscreen not alive — nothing to cancel */
           });
         await dropJob(msg.jobId);
         sendResponse({ ok: true });
         return;
       }
       case "download:progress": {
-        // Forwarded from offscreen → re-broadcast to popup, GC finished jobs.
         if (msg.payload.phase === "done" || msg.payload.phase === "error") {
           await dropJob(msg.payload.jobId);
         }
@@ -570,9 +489,12 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, sender, sendResponse)
       }
       default:
         sendResponse({ ok: false, error: "unhandled" });
+        // Surface unrelated suppressed senders so we don't silently lose
+        // events — e.g. a stale content script from a prior install.
+        if (sender.id && sender.id !== chrome.runtime.id) return;
     }
   })();
-  return true; // async sendResponse
+  return true;
 });
 
 /* ------------------------------ download flow ----------------------------- */
@@ -580,13 +502,11 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, sender, sendResponse)
 async function startDownload(
   stream: DetectedStream,
   jobId: string,
-  selection: { variantUri?: string; audioId?: string },
+  selection: { variantUri?: string; audioId?: string; subtitleId?: string },
 ): Promise<void> {
   await restoreFromSession();
 
   if (stream.kind === "mp4" || stream.kind === "audio") {
-    // Direct download — let the browser handle it. Inject a temporary Referer
-    // rule if we observed one for this URL during sniffing.
     await applyRefererRule(jobId, stream);
     try {
       await chrome.downloads.download({
@@ -597,15 +517,16 @@ async function startDownload(
     } finally {
       await removeRefererRule(jobId);
     }
-    void chrome.runtime.sendMessage({
-      type: "download:progress",
-      payload: { jobId, phase: "done", ratio: 1 },
-      target: "sw",
-    } satisfies RuntimeMessage);
+    void chrome.runtime
+      .sendMessage({
+        type: "download:progress",
+        payload: { jobId, phase: "done", ratio: 1 },
+        target: "sw",
+      } satisfies RuntimeMessage)
+      .catch(() => {});
     return;
   }
 
-  // HLS / DASH — needs the offscreen document for ffmpeg.wasm.
   const job: PersistedJob = {
     jobId,
     stream,
@@ -616,10 +537,18 @@ async function startDownload(
   await persistJobs();
   await applyRefererRule(jobId, stream);
   await ensureOffscreen();
+  await waitForOffscreenReady();
   await chrome.runtime
-    .sendMessage({ type: "download:start", stream, jobId, selection, target: "offscreen" } satisfies RuntimeMessage)
+    .sendMessage({
+      type: "download:start",
+      stream,
+      jobId,
+      selection,
+      target: "offscreen",
+    } satisfies RuntimeMessage)
     .catch(() => {
-      /* offscreen will retry on its onMessage handler installation */
+      /* the offscreen handler installs at module top — if this still races,
+         the resume-on-wake loop at the bottom of this file picks it up. */
     });
 }
 
@@ -630,14 +559,8 @@ async function dropJob(jobId: string): Promise<void> {
 }
 
 /* --------------------------- DNR Referer rules ---------------------------- */
-//
-// Many CDNs serve segments only when Referer matches the original page. The
-// offscreen `fetch` runs from a chrome-extension:// origin which the CDN
-// doesn't trust. We register a session-scoped DNR rule that rewrites Referer
-// for non-tab requests to the segment host while a download is running.
 
 function ruleIdFor(jobId: string): number {
-  // Stable numeric id derived from jobId — fits in DNR's int32 id space.
   let h = 0;
   for (let i = 0; i < jobId.length; i++) {
     h = (h * 31 + jobId.charCodeAt(i)) | 0;
@@ -712,6 +635,7 @@ const OFFSCREEN_PATH = "src/offscreen/index.html";
 async function ensureOffscreen(): Promise<void> {
   const has = await chrome.offscreen.hasDocument?.().catch(() => false);
   if (has) return;
+  offscreenReady = false;
   await chrome.offscreen.createDocument({
     url: OFFSCREEN_PATH,
     reasons: ["WORKERS" as chrome.offscreen.Reason],
@@ -719,11 +643,33 @@ async function ensureOffscreen(): Promise<void> {
   });
 }
 
-// Resume any persisted jobs as soon as the SW wakes up.
+/**
+ * `chrome.offscreen.createDocument` resolves once the document exists, but
+ * the offscreen module's onMessage listener is not installed until its top-
+ * level script runs. Forwarding before that race produces "Could not
+ * establish connection. Receiving end does not exist." We block until the
+ * offscreen sends `offscreen:ready`, with a short timeout so a stuck
+ * offscreen doesn't deadlock the SW.
+ */
+function waitForOffscreenReady(): Promise<void> {
+  if (offscreenReady) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    offscreenReadyWaiters.push(finish);
+    setTimeout(finish, OFFSCREEN_READY_TIMEOUT_MS);
+  });
+}
+
 void (async () => {
   await restoreFromSession();
   if (jobsById.size) {
     await ensureOffscreen();
+    await waitForOffscreenReady();
     for (const job of jobsById.values()) {
       await chrome.runtime
         .sendMessage({

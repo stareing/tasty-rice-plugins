@@ -1,8 +1,8 @@
 {
   "name": "media-stream-grabber",
   "private": true,
-  "version": "0.2.0",
-  "description": "Chrome extension that sniffs and downloads HLS / DASH / direct media streams from any page.",
+  "version": "0.3.0",
+  "description": "Chrome extension that captures HLS / DASH / direct media streams via the right-click menu and merges them into playable MP4.",
   "type": "module",
   "scripts": {
     "dev": "vite",

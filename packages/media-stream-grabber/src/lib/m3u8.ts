@@ -4,10 +4,13 @@
  *   - alternate renditions (#EXT-X-MEDIA TYPE=AUDIO/SUBTITLES/VIDEO)
  *   - media playlist with relative or absolute URIs
  *   - byte-range segments (#EXT-X-BYTERANGE)
- *   - AES-128 keys (#EXT-X-KEY METHOD=AES-128, IV=...) — single key only
+ *   - AES-128 keys (#EXT-X-KEY METHOD=AES-128, IV=...) with rotation
  *   - fMP4 init segments (#EXT-X-MAP) — required for any modern ≥1080p stream
+ *   - #EXT-X-MEDIA-SEQUENCE (required to compute the default IV per RFC 8216
+ *     §5.2 when an explicit IV attribute is absent — using array index would
+ *     decrypt to garbage on any stream where MEDIA-SEQUENCE != 0)
  *
- * Still NOT handled: SAMPLE-AES, multi-key rotation per segment.
+ * Still NOT handled: SAMPLE-AES.
  */
 
 export interface HlsKey {
@@ -26,6 +29,12 @@ export interface HlsSegment {
   duration: number;
   byteRange?: HlsByteRange;
   key?: HlsKey;
+  /**
+   * Absolute Media Sequence Number (RFC 8216 §4.3.3.2). Required to compute
+   * the default AES-128 IV — using the playlist-relative array index instead
+   * decrypts to garbage on any stream that does not start with sequence 0.
+   */
+  sequence: number;
 }
 
 export interface HlsInitSegment {
@@ -38,6 +47,8 @@ export interface HlsMediaPlaylist {
   totalDuration: number;
   /** From #EXT-X-MAP — fMP4 init segment, played before any media segment. */
   initSegment?: HlsInitSegment;
+  /** Media Sequence Number of the first segment. Defaults to 0 per spec. */
+  mediaSequence: number;
 }
 
 export interface HlsVariant {
@@ -117,6 +128,7 @@ export function parseM3U8(text: string, baseUrl: string): HlsParseResult {
   let pendingByteRange: HlsByteRange | undefined;
   let lastEndOffset = 0;
   let isMaster = false;
+  let mediaSequence = 0;
 
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i];
@@ -191,6 +203,13 @@ export function parseM3U8(text: string, baseUrl: string): HlsParseResult {
       continue;
     }
 
+    if (line.startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
+      const v = line.slice("#EXT-X-MEDIA-SEQUENCE:".length).trim();
+      const parsed = parseInt(v, 10);
+      if (Number.isFinite(parsed) && parsed >= 0) mediaSequence = parsed;
+      continue;
+    }
+
     if (line.startsWith("#EXT-X-BYTERANGE:")) {
       pendingByteRange = parseByteRange(
         line.slice("#EXT-X-BYTERANGE:".length),
@@ -208,6 +227,7 @@ export function parseM3U8(text: string, baseUrl: string): HlsParseResult {
       duration: pendingDuration,
       byteRange: pendingByteRange,
       key: currentKey,
+      sequence: mediaSequence + segments.length,
     });
     pendingDuration = 0;
     pendingByteRange = undefined;
@@ -218,5 +238,8 @@ export function parseM3U8(text: string, baseUrl: string): HlsParseResult {
     return { kind: "master", variants, renditions };
   }
   const totalDuration = segments.reduce((acc, s) => acc + s.duration, 0);
-  return { kind: "media", playlist: { segments, totalDuration, initSegment } };
+  return {
+    kind: "media",
+    playlist: { segments, totalDuration, initSegment, mediaSequence },
+  };
 }

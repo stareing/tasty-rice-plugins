@@ -124,7 +124,8 @@ export type RuntimeMessage = Targeted &
     | { type: "streams:list:result"; streams: DetectedStream[] }
     | { type: "streams:clear"; tabId: number }
     | { type: "streams:added"; tabId: number; stream: DetectedStream }
-    | { type: "streams:report-direct"; url: string; pageTitle: string; pageUrl: string }
+    | { type: "capture:arm"; tabId: number }
+    | { type: "capture:status"; tabId: number; armedUntil: number }
     | { type: "download:probe"; stream: DetectedStream; jobId: string }
     | { type: "download:probe:result"; jobId: string; result: ProbeResult }
     | {

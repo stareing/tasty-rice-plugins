@@ -47,6 +47,8 @@ export function App(): JSX.Element {
   const [streams, setStreams] = useState<DetectedStream[]>([]);
   const [progress, setProgress] = useState<Record<string, DownloadProgress>>({});
   const [picker, setPicker] = useState<PendingPicker | null>(null);
+  const [armedUntil, setArmedUntil] = useState<number>(0);
+  const [now, setNow] = useState<number>(() => Date.now());
   const jobToStreamRef = useRef<Map<string, string>>(new Map());
 
   const refresh = useCallback(async () => {
@@ -75,6 +77,9 @@ export function App(): JSX.Element {
       if (msg.type === "download:progress") {
         setProgress((prev) => ({ ...prev, [msg.payload.jobId]: msg.payload }));
       }
+      if (msg.type === "capture:status" && tab?.id && msg.tabId === tab.id) {
+        setArmedUntil(msg.armedUntil);
+      }
       if (msg.type === "download:probe:result") {
         setPicker((prev) => {
           if (!prev || prev.jobId !== msg.jobId) return prev;
@@ -102,6 +107,25 @@ export function App(): JSX.Element {
     setStreams([]);
     setProgress({});
   }, [tab?.id]);
+
+  const onArm = useCallback(async () => {
+    if (!tab?.id) return;
+    const resp = await send<RuntimeMessage>({ type: "capture:arm", tabId: tab.id });
+    if (resp && (resp as RuntimeMessage).type === "capture:status") {
+      setArmedUntil((resp as Extract<RuntimeMessage, { type: "capture:status" }>).armedUntil);
+    }
+  }, [tab?.id]);
+
+  // Tick the countdown while the capture window is open. The interval is cheap
+  // and only mounts while the popup is visible.
+  useEffect(() => {
+    if (armedUntil <= Date.now()) return;
+    const id = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(id);
+  }, [armedUntil]);
+
+  const armedSecondsLeft = Math.max(0, Math.ceil((armedUntil - now) / 1000));
+  const isArmed = armedSecondsLeft > 0;
 
   const onCopy = useCallback(async (url: string) => {
     try {
@@ -178,6 +202,14 @@ export function App(): JSX.Element {
         <span className="app__title">Media Stream Grabber</span>
         <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
           <span className="app__count">{streams.length} found</span>
+          <button
+            className="app__btn"
+            onClick={onArm}
+            disabled={!tab?.id || isArmed}
+            title="Arm a 30s capture window for this tab. Nothing is sniffed otherwise."
+          >
+            {isArmed ? `Capturing… ${armedSecondsLeft}s` : "Arm capture"}
+          </button>
           <button className="app__btn" onClick={onClear} disabled={!streams.length}>
             Clear
           </button>
@@ -186,9 +218,13 @@ export function App(): JSX.Element {
 
       {streams.length === 0 ? (
         <div className="empty">
-          No streams detected on this tab yet.
+          Nothing captured on this tab.
           <br />
-          Play a video and they will appear here.
+          Right-click anywhere on the page and pick
+          <br />
+          <strong>Media Stream Grabber → Capture next 30s of media</strong>,
+          <br />
+          then play the video.
         </div>
       ) : (
         streams.map((s) => {

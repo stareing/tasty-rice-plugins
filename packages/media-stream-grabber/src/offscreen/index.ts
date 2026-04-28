@@ -551,7 +551,10 @@ async function runDownloadDash(
 }
 
 function dashAsHls(refs: DashSegmentRef[]): HlsSegment[] {
-  return refs.map((s) => ({ uri: s.uri, duration: s.duration }));
+  // DASH segments are unencrypted in the supported (non-DRM) path, so the
+  // sequence value never reaches AES-128 IV derivation. We still populate it
+  // for type compatibility — using the array index is fine here.
+  return refs.map((s, i) => ({ uri: s.uri, duration: s.duration, sequence: i }));
 }
 
 function pickDashVariant(
@@ -783,7 +786,7 @@ async function downloadSegment(
   if (seg.key) {
     const keyBytes = keyCache.get(seg.key.uri);
     if (!keyBytes) throw new Error(`Missing key for segment ${index}.`);
-    const iv = ivForSequence(seg.key.iv, index);
+    const iv = ivForSequence(seg.key.iv, seg.sequence);
     bytes = await decryptAes128(bytes, keyBytes, iv);
   }
   return bytes;
