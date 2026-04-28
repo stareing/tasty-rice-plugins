@@ -1,93 +1,178 @@
-# Tasty Rice Plugins
+# Tasty Rice Plugins — Inventory
 
-Standalone repo (`stareing/tasty-rice-plugins`) for self-published browser
-extensions, desktop addons, CLIs, and small utilities. Surfaced on the main
-site via `my-blog/apps/web` → `/apps`.
+[![CI](https://github.com/stareing/tasty-rice-plugins/actions/workflows/ci.yml/badge.svg)](https://github.com/stareing/tasty-rice-plugins/actions/workflows/ci.yml)
+[![Release](https://github.com/stareing/tasty-rice-plugins/actions/workflows/release.yml/badge.svg)](https://github.com/stareing/tasty-rice-plugins/actions/workflows/release.yml)
+[![Latest release](https://img.shields.io/github/v/release/stareing/tasty-rice-plugins?label=release&color=blue)](https://github.com/stareing/tasty-rice-plugins/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
-This workspace lives at `my-blog/plugins/` for editing convenience but is its
-own git repo — no shared history with `my-blog`.
+> Self-published browser extensions, desktop addons, CLIs and small utilities.
+> Surfaced on the main site at <https://tastyrice.org/apps>.
+> Plugins live under `packages/<slug>/` and ship via tag-driven GitHub Releases.
 
-## Layout
+---
+
+## At a glance
+
+| Metric                          | Value                                       |
+| ------------------------------- | ------------------------------------------- |
+| **Total plugins**               | 1                                           |
+| Stable releases                 | 0                                           |
+| Beta releases                   | 1                                           |
+| Unreleased / WIP                | 0                                           |
+| Categories shipped              | Chrome extension                            |
+| Total source LOC (TS/TSX/CSS)   | ~3,300                                      |
+| Total source files              | 12                                          |
+| Latest published release        | [`v0.1.0`](https://github.com/stareing/tasty-rice-plugins/releases/latest) |
+| Release flow                    | tag-driven (`v*` → GitHub Actions → ZIP attached) |
+
+---
+
+## Plugins
+
+### `media-stream-grabber`
+
+![status](https://img.shields.io/badge/status-beta-yellow)
+![category](https://img.shields.io/badge/category-Chrome%20MV3-blue)
+![version](https://img.shields.io/badge/dynamic/json?label=source&query=%24.version&url=https%3A%2F%2Fraw.githubusercontent.com%2Fstareing%2Ftasty-rice-plugins%2Fmain%2Fpackages%2Fmedia-stream-grabber%2Fpackage.json)
+![license](https://img.shields.io/badge/license-MIT-green)
+
+Chrome extension that sniffs HLS / DASH / direct media URLs from any page and
+merges segmented streams into a single playable file.
+
+| Field             | Value                                                                                                                       |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| **Slug**          | `media-stream-grabber`                                                                                                      |
+| **Status**        | Beta                                                                                                                        |
+| **Category**      | Chrome MV3 extension (Chromium ≥ 88: Chrome / Edge / Brave / Vivaldi / Arc / Opera)                                         |
+| **Latest tag**    | [`v0.1.0`](https://github.com/stareing/tasty-rice-plugins/releases/tag/v0.1.0)                                              |
+| **Source version**| `0.2.0` (unreleased — DASH support, see commits)                                                                            |
+| **Stack**         | TypeScript · React · Vite · CRXJS · `ffmpeg.wasm`                                                                           |
+| **Source LOC**    | ~3,300 across 12 files                                                                                                      |
+| **Runtime deps**  | 4 (`@ffmpeg/ffmpeg`, `@ffmpeg/util`, `react`, `react-dom`)                                                                  |
+| **Dev deps**      | 8                                                                                                                           |
+| **Build size**    | 784 KB unpacked · **192 KB zipped**                                                                                         |
+| **Permissions**   | `webRequest` · `downloads` · `offscreen` · `storage` · `tabs` · `activeTab` · `scripting` · `contextMenus` · `notifications` |
+| **Install**       | [Download latest ZIP](https://github.com/stareing/tasty-rice-plugins/releases/latest/download/media-stream-grabber.zip)     |
+| **Docs**          | [README](./packages/media-stream-grabber/README.md) · [Install (EN)](./packages/media-stream-grabber/INSTALL.md) · [Install (中文)](./packages/media-stream-grabber/INSTALL.zh.md) |
+| **Source**        | [`packages/media-stream-grabber/`](./packages/media-stream-grabber/)                                                        |
+| **Public page**   | <https://tastyrice.org/apps/media-stream-grabber>                                                                           |
+
+---
+
+## Release history
+
+| Version  | Date       | Plugins changed         | Asset (ZIP)                                                                                              | Highlights                                |
+| -------- | ---------- | ----------------------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| `v0.1.0` | 2026-04-28 | `media-stream-grabber`  | [`media-stream-grabber.zip`](https://github.com/stareing/tasty-rice-plugins/releases/latest/download/media-stream-grabber.zip) (192 KB) | First public release · HLS pipeline · context menus |
+
+Stable URL — always points at the latest release of any plugin:
+`https://github.com/stareing/tasty-rice-plugins/releases/latest/download/<slug>.zip`
+
+---
+
+## Repo footprint
+
+| Item                     | Count                                                |
+| ------------------------ | ---------------------------------------------------- |
+| Plugins                  | 1                                                    |
+| Workspace commits        | 6 (`git rev-list --count HEAD`)                      |
+| GitHub Actions workflows | 2 (`ci.yml`, `release.yml`)                          |
+| Languages                | TypeScript (98%) · CSS (2%)                          |
+| Workspace shared deps    | 2 dev (`adm-zip`, `typescript`)                      |
+
+---
+
+## How it's structured
 
 ```
 plugins/
-├── package.json            # npm workspace root (workspaces: ["packages/*"])
-├── tsconfig.base.json      # shared TS compiler options — extend per-plugin
-├── README.md               # you are here
-└── packages/               # all plugins live here, one dir each
-    └── <plugin-slug>/      # directory name === /apps URL slug
+├── package.json              # npm workspaces root (workspaces: ["packages/*"])
+├── tsconfig.base.json        # shared TS compiler options — extend per-plugin
+├── scripts/release.mjs       # node + adm-zip → dist-release/<slug>.zip
+├── .github/workflows/
+│   ├── ci.yml                # type-check + build on push/PR
+│   └── release.yml           # tag-driven release, attaches ZIPs to GH Release
+└── packages/                 # all plugins live here, one dir each
+    └── <plugin-slug>/        # directory name === /apps URL slug
         ├── package.json
-        ├── tsconfig.json   # extends ../../tsconfig.base.json
+        ├── tsconfig.json     # extends ../../tsconfig.base.json
+        ├── README.md
         └── src/
 ```
 
-The intermediate `packages/` directory keeps workspace tooling (this README,
-the root package.json, shared TS config, CI configs) cleanly separated from
-the plugins themselves. New top-level concerns can be added at the workspace
-root without crowding the plugin namespace.
+Conventions:
 
-## Conventions
+- Directory name **equals** the `/apps/[slug]` URL **and** the entry in
+  `apps/web/lib/apps.ts` on the main site. No mismatches.
+- One plugin = one product. No cross-plugin imports — extract a real package
+  if two need to share code.
+- Each plugin owns its own `dist/` (gitignored). The workspace root only
+  produces release ZIPs in `dist-release/` (gitignored).
 
-- **Directory name = `apps.ts` slug.** The `/apps/[slug]` page in the main
-  site resolves source links by joining the slug with this repo's GitHub tree
-  URL (`…/tree/main/packages/<slug>`), so they must match exactly.
-- **One plugin = one product.** No shared `src/` across plugins — if two need
-  to share code, extract a real package instead of cross-importing.
-- **Each plugin owns its build output.** `dist/` is gitignored per-plugin; the
-  workspace root never produces a build artifact.
-- **Each plugin must pass `npm run type-check`.** The root `npm run type-check`
-  fans this out across all workspaces.
+---
 
-## Common commands
+## Adding a plugin
 
-From this directory:
+1. `cd packages && mkdir <slug> && cd <slug>` — slug must match the `/apps` entry.
+2. `npm init -y`, set `"private": true`, add `build` and `type-check` scripts.
+3. `tsconfig.json` extends `../../tsconfig.base.json` (note the two-level path).
+4. From the workspace root: `npm install` to link it into the workspace.
+5. Add an entry to `my-blog/apps/web/lib/apps.ts` so the website knows about it.
 
-```bash
-npm install                  # installs all plugins via workspaces
-npm run build                # build every plugin (skipped if no `build` script)
-npm run type-check           # type-check every plugin
-npm run release:local        # build + pack release zips into dist-release/
-npm run release:pack         # pack only (assumes build already ran)
-npm run clean                # rm -rf dist/ + node_modules/ + dist-release/
-```
+---
 
-From a single plugin:
+## Releasing
+
+Tag-driven and fully automated:
 
 ```bash
-cd packages/media-stream-grabber/
-npm run dev                  # plugin-specific dev server
-npm run build                # plugin-specific production build
+# 1. Bump the plugin's package.json version
+cd packages/<slug> && npm version patch
+
+# 2. Tag and push from the workspace root
+cd ../..
+git commit -am "release(<slug>): vX.Y.Z"
+git tag vX.Y.Z
+git push origin main --tags
 ```
 
-## Release flow (GitHub Actions)
+The `Release` workflow then:
 
-Releases are fully automated. To cut a new version of any plugin:
-
-1. Bump the plugin's `package.json` `version` (e.g. `packages/media-stream-grabber/package.json`).
-2. Commit and tag: `git tag v0.1.1 && git push origin main --tags`.
-3. The `Release` workflow builds every plugin, packs each `dist/` into a ZIP,
-   and creates a GitHub Release with the assets attached.
+1. `npm ci` + `npm run type-check` + `npm run build` across all plugins.
+2. `npm run release:pack` → `dist-release/<slug>-vX.Y.Z.zip` + `<slug>.zip`.
+3. Creates a GitHub Release with all ZIPs attached and Chrome install steps
+   in the body.
 
 Each release publishes two assets per plugin:
 
 - `<slug>-v<version>.zip` — versioned, immutable.
-- `<slug>.zip` — unversioned alias, so users can always grab the latest from
-  `https://github.com/stareing/tasty-rice-plugins/releases/latest/download/<slug>.zip`.
+- `<slug>.zip` — unversioned alias. Stable URL:
+  `releases/latest/download/<slug>.zip`.
 
-The `CI` workflow runs `type-check` + `build` on every push and PR to keep
-`main` green between releases.
+---
 
-## Adding a new plugin
+## Local commands
 
-1. `cd packages/ && mkdir <slug> && cd <slug>` — slug must match the `/apps` entry.
-2. `npm init -y`, set `"private": true`, add a `build` and `type-check` script.
-3. Create `tsconfig.json` extending `../../tsconfig.base.json` (note the two-level path).
-4. Add an entry to `my-blog/apps/web/lib/apps.ts` so the website knows about
-   it (the website lives in a different repo — coordinate the two changes).
-5. From the workspace root, run `npm install` so the workspace links it in.
+| From            | Command                  | What it does                                              |
+| --------------- | ------------------------ | --------------------------------------------------------- |
+| workspace root  | `npm install`            | Install every plugin via npm workspaces                   |
+| workspace root  | `npm run build`          | Build every plugin (skipped if no `build` script)         |
+| workspace root  | `npm run type-check`     | Type-check every plugin                                   |
+| workspace root  | `npm run release:local`  | Build + pack release ZIPs into `dist-release/`            |
+| workspace root  | `npm run release:pack`   | Pack only (assumes build already ran)                     |
+| workspace root  | `npm run clean`          | Wipe all `dist/`, `node_modules/`, `dist-release/`        |
+| `packages/<slug>/` | `npm run dev`         | Per-plugin dev server (Vite + HMR for the popup)          |
+| `packages/<slug>/` | `npm run build`       | Per-plugin production build                               |
 
-## Currently shipping
+---
 
-| Slug                     | Kind             | Status |
-| ------------------------ | ---------------- | ------ |
-| `media-stream-grabber`   | Chrome MV3 ext   | beta   |
+## Public surface
+
+- **Storefront**: <https://tastyrice.org/apps>
+- **Per-plugin pages**: `https://tastyrice.org/apps/<slug>`
+- **Releases**: <https://github.com/stareing/tasty-rice-plugins/releases>
+- **Issues**: <https://github.com/stareing/tasty-rice-plugins/issues>
+
+`my-blog/apps/web/lib/apps.ts` is the static source of truth on the website
+side — it carries the bilingual descriptions, badge, accent colors and
+download URL pattern used by `/apps/[slug]`.
