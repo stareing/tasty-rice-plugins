@@ -57,6 +57,11 @@ To upgrade later, download the new ZIP, point "Load unpacked" at the new
 folder, or hit the refresh icon on the extension card. Chrome treats this as
 a normal extension — popup, context menus, badge counts and all.
 
+For the full walkthrough — supported browsers, OS-specific unzip tips,
+first-run usage, troubleshooting, permission explanations and a "build
+from source" path — see [`INSTALL.md`](./INSTALL.md) (English) /
+[`INSTALL.zh.md`](./INSTALL.zh.md) (中文).
+
 ## What it currently handles
 
 | Source                                  | Status                                 |
