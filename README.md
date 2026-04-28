@@ -1,12 +1,16 @@
-# Plugins Workspace
+# Tasty Rice Plugins
 
-Home for self-published browser extensions, desktop addons, and small utilities
-that ship via the `/apps` page on the main site.
+Standalone repo (`stareing/tasty-rice-plugins`) for self-published browser
+extensions, desktop addons, CLIs, and small utilities. Surfaced on the main
+site via `my-blog/apps/web` → `/apps`.
+
+This workspace lives at `my-blog/plugins/` for editing convenience but is its
+own git repo — no shared history with `my-blog`.
 
 ## Layout
 
 ```
-apps/plugins/
+plugins/
 ├── package.json            # npm workspace root (workspaces: ["*"])
 ├── tsconfig.base.json      # shared TS compiler options — extend per-plugin
 ├── README.md               # you are here
@@ -18,9 +22,9 @@ apps/plugins/
 
 ## Conventions
 
-- **Directory name = `apps.ts` slug.** The `/apps/[slug]` page resolves source
-  links by joining `apps/plugins/<slug>` with the GitHub tree URL, so they
-  must match exactly.
+- **Directory name = `apps.ts` slug.** The `/apps/[slug]` page in the main
+  site resolves source links by joining the slug with this repo's GitHub tree
+  URL, so they must match exactly.
 - **One plugin = one product.** No shared `src/` across plugins — if two need
   to share code, extract a real package instead of cross-importing.
 - **Each plugin owns its build output.** `dist/` is gitignored per-plugin; the
@@ -52,8 +56,9 @@ npm run build                # plugin-specific production build
 1. `mkdir <slug> && cd <slug>` — slug must match the `/apps` entry.
 2. `npm init -y`, set `"private": true`, add a `build` and `type-check` script.
 3. Create `tsconfig.json` extending `../tsconfig.base.json`.
-4. Add an entry to `apps/web/lib/apps.ts` so the website knows about it.
-5. From `apps/plugins/`, run `npm install` so the workspace links it in.
+4. Add an entry to `my-blog/apps/web/lib/apps.ts` so the website knows about
+   it (the website lives in a different repo — coordinate the two changes).
+5. From this directory, run `npm install` so the workspace links it in.
 
 ## Currently shipping
 
