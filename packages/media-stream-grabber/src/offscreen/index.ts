@@ -54,7 +54,7 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, _sender, sendResponse
         jobId: msg.jobId,
         phase: "error",
         ratio: 0,
-        error: (err as Error).message,
+        error: errorMessage(err),
       });
     });
     sendResponse({ ok: true });
@@ -66,7 +66,7 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, _sender, sendResponse
         jobId: msg.jobId,
         phase: "error",
         ratio: 0,
-        error: (err as Error).message,
+        error: errorMessage(err),
       });
     });
     sendResponse({ ok: true });
@@ -253,16 +253,18 @@ async function probeHls(stream: DetectedStream, jobId: string): Promise<void> {
     audioGroup: v.audioGroup,
   }));
 
-  const audioTracks: AudioTrackOption[] = parsed.renditions
-    .filter((r) => r.type === "AUDIO")
-    .map((r) => ({
-      groupId: r.groupId,
-      id: `${r.groupId}::${r.name}`,
-      name: r.name,
-      language: r.language,
-      default: r.default,
-      uri: r.uri,
-    }));
+  const audioTracks: AudioTrackOption[] = dedupeAudioTracks(
+    parsed.renditions
+      .filter((r) => r.type === "AUDIO")
+      .map((r) => ({
+        groupId: r.groupId,
+        id: `${r.groupId}::${r.name}`,
+        name: r.name,
+        language: r.language,
+        default: r.default,
+        uri: r.uri,
+      })),
+  );
 
   const subtitleTracks: SubtitleTrackOption[] = parsed.renditions
     .filter((r) => r.type === "SUBTITLES" && r.uri)
@@ -365,6 +367,19 @@ function dashAudioId(setId: string, repId: string): string {
 function dashSubtitleId(setId: string, repId: string): string {
   return `${DASH_TEXT_PREFIX}${setId}::${repId}`;
 }
+
+function dedupeAudioTracks(tracks: AudioTrackOption[]): AudioTrackOption[] {
+  const seen = new Set<string>();
+  const out: AudioTrackOption[] = [];
+  for (const track of tracks) {
+    const key = track.uri ? `uri:${track.uri}` : `meta:${track.groupId}::${track.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(track);
+  }
+  return out;
+}
+
 function parseDashId(value: string, prefix: string): { setId: string; repId: string } | undefined {
   if (!value.startsWith(prefix)) return undefined;
   const [setId, repId] = value.slice(prefix.length).split("::");
@@ -457,11 +472,20 @@ async function runDownloadHls(
   let audioSegments: HlsSegment[] | undefined;
   let audioInit: Uint8Array | undefined;
   if (audioRendition?.uri) {
-    const audio = await fetchHlsAudioPlaylist(audioRendition.uri);
+    const audio = await fetchHlsAudioPlaylist(
+      audioRendition.uri,
+      videoPlaylist.playlist.totalDuration,
+      jobId,
+      true,
+    );
     audioSegments = audio?.segments;
     audioInit = audio?.init;
   } else {
-    const audio = await fetchHlsAudioPlaylist(deriveSiblingAudioPlaylistUrl(videoPlaylistUrl));
+    const audio = await fetchHlsAudioPlaylist(
+      deriveSiblingAudioPlaylistUrl(videoPlaylistUrl),
+      videoPlaylist.playlist.totalDuration,
+      jobId,
+    );
     audioSegments = audio?.segments;
     audioInit = audio?.init;
   }
@@ -528,19 +552,40 @@ function deriveSiblingAudioPlaylistUrl(videoPlaylistUrl: string): string | undef
 
 async function fetchHlsAudioPlaylist(
   url: string | undefined,
+  videoDuration: number,
+  jobId: string,
+  required = false,
 ): Promise<{ segments: HlsSegment[]; init?: Uint8Array } | undefined> {
   if (!url) return undefined;
   try {
     const text = await fetchText(url);
     const parsed = parseM3U8(text, url);
     if (parsed.kind !== "media" || !parsed.playlist.segments.length) return undefined;
+    if (!durationsCompatible(videoDuration, parsed.playlist.totalDuration)) {
+      throw new Error(
+        `Audio playlist duration (${parsed.playlist.totalDuration.toFixed(2)}s) does not match video (${videoDuration.toFixed(2)}s).`,
+      );
+    }
     const init = parsed.playlist.initSegment
       ? await fetchInitSegment(parsed.playlist.initSegment)
       : undefined;
     return { segments: parsed.playlist.segments, init };
-  } catch {
+  } catch (err) {
+    if (required) throw err;
+    reportProgress({
+      jobId,
+      phase: "fetching-playlist",
+      ratio: 0,
+      message: `Audio track ignored: ${errorMessage(err)}`,
+    });
     return undefined;
   }
+}
+
+function durationsCompatible(videoDuration: number, audioDuration: number): boolean {
+  if (!videoDuration || !audioDuration) return true;
+  const delta = Math.abs(videoDuration - audioDuration);
+  return delta <= Math.max(2, videoDuration * 0.08);
 }
 
 async function resolveKeys(
@@ -827,7 +872,7 @@ async function downloadSegmentWithRetry(
     }
   }
   throw new Error(
-    `Segment ${index} failed after ${SEGMENT_RETRIES + 1} attempts: ${(lastErr as Error)?.message ?? "unknown"}`,
+    `Segment ${index} failed after ${SEGMENT_RETRIES + 1} attempts: ${errorMessage(lastErr)}`,
   );
 }
 
@@ -966,7 +1011,7 @@ async function remuxToPlayable(
       const webm = await recordWithChromeMediaRecorder(videoBytes, audioBytes);
       return { bytes: webm, mimeType: "video/webm", extension: ".webm" };
     } catch (nativeErr) {
-      const nativeMsg = nativeErr instanceof Error ? nativeErr.message : String(nativeErr || "");
+      const nativeMsg = errorMessage(nativeErr);
       throw new Error(
         `Audio was downloaded, but neither ffmpeg nor Chrome MediaRecorder could mux it. ffmpeg: ${formatFfmpegError(lastErr)}. native: ${nativeMsg}`,
       );
@@ -1035,7 +1080,7 @@ async function recordWithChromeMediaRecorder(
   const mediaSource = new MediaSource();
   const video = document.createElement("video");
   video.playsInline = true;
-  video.volume = 0;
+  video.volume = 1;
   video.src = URL.createObjectURL(mediaSource);
   document.body.append(video);
 
@@ -1108,9 +1153,21 @@ function once(target: EventTarget, type: string): Promise<Event> {
 }
 
 function formatFfmpegError(err: unknown): string {
-  const msg = err instanceof Error ? err.message : String(err || "");
+  const msg = errorMessage(err);
   const log = ffmpegLogTail.slice(-6).join(" | ");
   return [msg, log].filter(Boolean).join(" — ") || "ffmpeg failed without details";
+}
+
+function errorMessage(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message;
+  if (typeof err === "string" && err.trim()) return err;
+  try {
+    const json = JSON.stringify(err);
+    if (json && json !== "{}") return json;
+  } catch {
+    /* ignore */
+  }
+  return String(err || "unknown");
 }
 
 function withExtension(filename: string, extension: string): string {
@@ -1129,7 +1186,7 @@ function reportSubtitleError(jobId: string, err: unknown): void {
     jobId,
     phase: "saving",
     ratio: 0.99,
-    message: `Subtitle download failed: ${(err as Error)?.message ?? "unknown"}`,
+    message: `Subtitle download failed: ${errorMessage(err)}`,
   });
 }
 
