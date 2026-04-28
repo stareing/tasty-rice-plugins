@@ -681,10 +681,13 @@ async function finishDownload(
   }
 
   reportProgress({ jobId, phase: "merging", ratio: 0.95, message: "Remuxing to MP4…" });
-  const mp4 = await remuxToMp4(videoBytes, audioBytes, jobId);
+  const output = await remuxToPlayable(videoBytes, audioBytes, jobId);
 
   reportProgress({ jobId, phase: "saving", ratio: 0.99 });
-  await saveBlob(new Blob([toArrayBuffer(mp4)], { type: "video/mp4" }), stream.suggestedName);
+  await saveBlob(
+    new Blob([toArrayBuffer(output.bytes)], { type: output.mimeType }),
+    withExtension(stream.suggestedName, output.extension),
+  );
 
   reportProgress({ jobId, phase: "done", ratio: 1 });
   await idbClearJob(jobId);
@@ -854,12 +857,18 @@ function sleep(ms: number): Promise<void> {
 /* ------------------------- ffmpeg.wasm remux ------------------------- */
 
 let ffmpegPromise: Promise<import("@ffmpeg/ffmpeg").FFmpeg> | null = null;
+const ffmpegLogTail: string[] = [];
 
 async function getFfmpeg() {
   if (!ffmpegPromise) {
     ffmpegPromise = (async () => {
       const { FFmpeg } = await import("@ffmpeg/ffmpeg");
       const ff = new FFmpeg();
+      ff.on("log", ({ message }) => {
+        if (!message) return;
+        ffmpegLogTail.push(message);
+        if (ffmpegLogTail.length > 20) ffmpegLogTail.shift();
+      });
       const coreURL = chrome.runtime.getURL("ffmpeg/ffmpeg-core.js");
       const wasmURL = chrome.runtime.getURL("ffmpeg/ffmpeg-core.wasm");
       await ff.load({
@@ -872,11 +881,17 @@ async function getFfmpeg() {
   return ffmpegPromise;
 }
 
-async function remuxToMp4(
+interface RemuxOutput {
+  bytes: Uint8Array;
+  mimeType: string;
+  extension: string;
+}
+
+async function remuxToPlayable(
   videoBytes: Uint8Array,
   audioBytes: Uint8Array | undefined,
   jobId: string,
-): Promise<Uint8Array> {
+): Promise<RemuxOutput> {
   const ff = await getFfmpeg();
   await ff.writeFile("video.bin", videoBytes);
   if (audioBytes) await ff.writeFile("audio.bin", audioBytes);
@@ -909,6 +924,16 @@ async function remuxToMp4(
           "-c", "copy",
           "-shortest",
         ],
+        [
+          "-i", "video.bin",
+          "-i", "audio.bin",
+          "-map", "0:v:0",
+          "-map", "1:a:0",
+          "-c:v", "copy",
+          "-c:a", "aac",
+          "-b:a", "160k",
+          "-shortest",
+        ],
       ]
     : [
         ["-i", "video.bin", "-c", "copy"],
@@ -921,18 +946,31 @@ async function remuxToMp4(
     try {
       const code = await ff.exec([...attempts[i], output]);
       if (code !== 0) throw new Error(`ffmpeg exited with code ${code}`);
+      await assertPlayableOutput(ff, output, Boolean(audioBytes));
       const out = await ff.readFile(output);
       if (typeof out === "string") throw new Error("ffmpeg returned text, expected binary.");
-      return out as Uint8Array;
+      return { bytes: out as Uint8Array, mimeType: "video/mp4", extension: ".mp4" };
     } catch (err) {
       lastErr = err;
     }
   }
 
   if (audioBytes) {
-    throw new Error(
-      `Audio was downloaded, but ffmpeg could not mux it with the video: ${(lastErr as Error)?.message ?? "unknown"}`,
-    );
+    reportProgress({
+      jobId,
+      phase: "merging",
+      ratio: 0.97,
+      message: `ffmpeg mux failed; trying Chrome MediaRecorder fallback. ${formatFfmpegError(lastErr)}`,
+    });
+    try {
+      const webm = await recordWithChromeMediaRecorder(videoBytes, audioBytes);
+      return { bytes: webm, mimeType: "video/webm", extension: ".webm" };
+    } catch (nativeErr) {
+      const nativeMsg = nativeErr instanceof Error ? nativeErr.message : String(nativeErr || "");
+      throw new Error(
+        `Audio was downloaded, but neither ffmpeg nor Chrome MediaRecorder could mux it. ffmpeg: ${formatFfmpegError(lastErr)}. native: ${nativeMsg}`,
+      );
+    }
   }
 
   try {
@@ -940,12 +978,143 @@ async function remuxToMp4(
       jobId,
       phase: "merging",
       ratio: 0.97,
-      message: `Video-only remux failed (${(lastErr as Error)?.message ?? "unknown"}); saving raw bytes.`,
+      message: `Video-only remux failed (${formatFfmpegError(lastErr)}); saving raw bytes.`,
     });
-    return videoBytes;
+    return { bytes: videoBytes, mimeType: "video/mp4", extension: ".mp4" };
   } catch {
-    return videoBytes;
+    return { bytes: videoBytes, mimeType: "video/mp4", extension: ".mp4" };
   }
+}
+
+async function assertPlayableOutput(
+  ff: import("@ffmpeg/ffmpeg").FFmpeg,
+  filename: string,
+  requireAudio: boolean,
+): Promise<void> {
+  const probeFile = `${filename}.probe.txt`;
+  const code = await ff.ffprobe([
+    "-v", "error",
+    "-show_entries", "stream=codec_type",
+    "-of", "csv=p=0",
+    filename,
+    "-o", probeFile,
+  ]);
+  if (code !== 0) throw new Error(`ffprobe exited with code ${code}`);
+  const raw = await ff.readFile(probeFile, "utf8");
+  const text = typeof raw === "string" ? raw : new TextDecoder().decode(raw);
+  const streams = text.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  if (!streams.includes("video")) throw new Error("ffmpeg output has no video track.");
+  if (requireAudio && !streams.includes("audio")) {
+    throw new Error("ffmpeg output has no audio track.");
+  }
+}
+
+async function recordWithChromeMediaRecorder(
+  videoBytes: Uint8Array,
+  audioBytes: Uint8Array,
+): Promise<Uint8Array> {
+  if (!("MediaSource" in self)) throw new Error("MediaSource is unavailable.");
+  if (!("MediaRecorder" in self)) throw new Error("MediaRecorder is unavailable.");
+
+  const videoMime = pickSupportedMime([
+    'video/mp4; codecs="avc1.64001f"',
+    'video/mp4; codecs="avc1.4d401f"',
+    'video/mp4; codecs="avc1.42e01e"',
+    'video/mp4; codecs="hvc1"',
+    "video/mp4",
+  ]);
+  const audioMime = pickSupportedMime([
+    'audio/mp4; codecs="mp4a.40.2"',
+    'audio/mp4; codecs="mp4a.40.5"',
+    "audio/mp4",
+  ]);
+  if (!videoMime || !audioMime) {
+    throw new Error("Chrome cannot append these MP4 tracks via MediaSource.");
+  }
+
+  const mediaSource = new MediaSource();
+  const video = document.createElement("video");
+  video.playsInline = true;
+  video.volume = 0;
+  video.src = URL.createObjectURL(mediaSource);
+  document.body.append(video);
+
+  try {
+    await once(mediaSource, "sourceopen");
+    const videoBuffer = mediaSource.addSourceBuffer(videoMime);
+    const audioBuffer = mediaSource.addSourceBuffer(audioMime);
+    await appendSourceBuffer(videoBuffer, videoBytes);
+    await appendSourceBuffer(audioBuffer, audioBytes);
+    mediaSource.endOfStream();
+
+    await video.play();
+    const stream = (video as HTMLVideoElement & { captureStream: () => MediaStream }).captureStream();
+    const recorderMime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")
+      ? "video/webm;codecs=vp9,opus"
+      : "video/webm";
+    const chunks: Blob[] = [];
+    const recorder = new MediaRecorder(stream, { mimeType: recorderMime });
+    recorder.ondataavailable = (event) => {
+      if (event.data.size) chunks.push(event.data);
+    };
+    const stopped = once(recorder, "stop");
+    recorder.start(1000);
+    if (!stream.getAudioTracks().length) {
+      throw new Error("MediaSource produced no audio track.");
+    }
+    await Promise.race([
+      once(video, "ended"),
+      sleep(Math.max(30_000, Math.ceil((video.duration || 0) * 1000) + 5000)),
+    ]);
+    if (recorder.state !== "inactive") recorder.stop();
+    await stopped;
+    if (!chunks.length) throw new Error("MediaRecorder produced no data.");
+    return new Uint8Array(await new Blob(chunks, { type: "video/webm" }).arrayBuffer());
+  } finally {
+    URL.revokeObjectURL(video.src);
+    video.remove();
+  }
+}
+
+function pickSupportedMime(candidates: string[]): string | undefined {
+  return candidates.find((mime) => MediaSource.isTypeSupported(mime));
+}
+
+function appendSourceBuffer(buffer: SourceBuffer, bytes: Uint8Array): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cleanup = (): void => {
+      buffer.removeEventListener("updateend", onDone);
+      buffer.removeEventListener("error", onError);
+    };
+    const onDone = (): void => {
+      cleanup();
+      resolve();
+    };
+    const onError = (): void => {
+      cleanup();
+      reject(new Error("SourceBuffer append failed."));
+    };
+    buffer.addEventListener("updateend", onDone, { once: true });
+    buffer.addEventListener("error", onError, { once: true });
+    buffer.appendBuffer(toArrayBuffer(bytes));
+  });
+}
+
+function once(target: EventTarget, type: string): Promise<Event> {
+  return new Promise((resolve, reject) => {
+    target.addEventListener(type, resolve, { once: true });
+    target.addEventListener("error", () => reject(new Error(`${type} failed.`)), { once: true });
+  });
+}
+
+function formatFfmpegError(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err || "");
+  const log = ffmpegLogTail.slice(-6).join(" | ");
+  return [msg, log].filter(Boolean).join(" — ") || "ffmpeg failed without details";
+}
+
+function withExtension(filename: string, extension: string): string {
+  return filename.replace(/\.[a-z0-9]{1,5}$/i, "") + extension;
 }
 
 /* --------------------------- subtitles --------------------------- */
