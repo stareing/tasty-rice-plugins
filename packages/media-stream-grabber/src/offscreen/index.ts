@@ -37,13 +37,21 @@ import {
 const cancelled = new Set<string>();
 const SEGMENT_RETRIES = 3;
 const SEGMENT_RETRY_DELAY_MS = 600;
-const SEGMENT_CONCURRENCY = 6;
+// Empirically 4 is the sweet spot — high enough to saturate residential
+// links, low enough that CDNs (esp. Akamai/Cloudflare with per-IP throttle
+// shaping) don't start returning 429 / connection-reset mid-job. Mirrors the
+// production-validated default in other open-source HLS downloaders.
+const SEGMENT_CONCURRENCY = 4;
+// Per-fetch wall-clock budget. A stalled segment behind a flaky CDN was
+// previously able to hang the whole job indefinitely; the AbortController
+// below converts that into a normal retry path.
+const SEGMENT_FETCH_TIMEOUT_MS = 30_000;
 const IDB_NAME = "msg.segments";
 const IDB_STORE = "buffers";
 const DASH_KEY_PREFIX = "dash::";
 const DASH_AUDIO_PREFIX = "dash-audio::";
 const DASH_TEXT_PREFIX = "dash-text::";
-const HLS_CHILD_PLAYLIST_RE = /_(?:\d+w|audio)\.m3u8(\?|$|#)/i;
+const HLS_CHILD_PLAYLIST_RE = /(_(?:\d+w|audio|video|v\d+|a\d+)|-(?:video|audio|av)\d*)\.m3u8(\?|$|#)/i;
 
 chrome.runtime.onMessage.addListener((msg: RuntimeMessage, _sender, sendResponse) => {
   if (msg.target !== "offscreen") return false;
@@ -77,6 +85,15 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, _sender, sendResponse
     sendResponse({ ok: true });
     return true;
   }
+  if (msg.type === "thumb:request") {
+    void runThumbnail(msg.stream)
+      .then((dataUrl) => sendThumbResult(msg.streamId, dataUrl))
+      .catch((err) =>
+        sendThumbResult(msg.streamId, undefined, errorMessage(err)),
+      );
+    sendResponse({ ok: true });
+    return true;
+  }
   return false;
 });
 
@@ -100,19 +117,73 @@ function reportProgress(p: DownloadProgress): void {
 
 /* --------------------------------- HTTP --------------------------------- */
 
+/** Categorised fetch failure — surfaces to the popup as a meaningful phase. */
+export class HttpStatusError extends Error {
+  readonly kind = "http" as const;
+  constructor(public readonly status: number, public readonly url: string) {
+    super(`HTTP ${status}`);
+  }
+}
+
+export class FetchTimeoutError extends Error {
+  readonly kind = "timeout" as const;
+  constructor(public readonly url: string, public readonly ms: number) {
+    super(`Timed out after ${ms}ms`);
+  }
+}
+
+export class FetchAbortedError extends Error {
+  readonly kind = "abort" as const;
+  constructor(public readonly url: string) {
+    super(`Aborted`);
+  }
+}
+
+async function fetchWithBudget(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    if (timedOut) throw new FetchTimeoutError(url, timeoutMs);
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new FetchAbortedError(url);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fetchBytes(
   url: string,
   headers?: Record<string, string>,
 ): Promise<Uint8Array> {
-  const res = await fetch(url, { headers, credentials: "include" });
-  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+  const res = await fetchWithBudget(
+    url,
+    { headers, credentials: "include" },
+    SEGMENT_FETCH_TIMEOUT_MS,
+  );
+  if (!res.ok) throw new HttpStatusError(res.status, url);
   const buf = await res.arrayBuffer();
   return new Uint8Array(buf);
 }
 
 async function fetchText(url: string): Promise<string> {
-  const res = await fetch(url, { credentials: "include" });
-  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+  const res = await fetchWithBudget(
+    url,
+    { credentials: "include" },
+    SEGMENT_FETCH_TIMEOUT_MS,
+  );
+  if (!res.ok) throw new HttpStatusError(res.status, url);
   return res.text();
 }
 
@@ -240,7 +311,23 @@ async function probeHls(stream: DetectedStream, jobId: string): Promise<void> {
   const text = await fetchText(stream.url);
   const parsed = parseM3U8(text, stream.url);
   if (parsed.kind === "media") {
-    reportProbe(jobId, { variants: [], audioTracks: [], subtitleTracks: [], singlePlaylist: true });
+    const isLive = parsed.playlist.liveness !== "vod";
+    const drm = parsed.playlist.drmSystems.length
+      ? [...parsed.playlist.drmSystems]
+      : undefined;
+    reportProbe(jobId, {
+      variants: [],
+      audioTracks: [],
+      subtitleTracks: [],
+      singlePlaylist: true,
+      isLive: isLive || undefined,
+      drm,
+      unsupported: drm
+        ? { reason: `Content is protected (${drm.join(", ")}); the segments stay encrypted.` }
+        : isLive
+          ? { reason: "This is a live or event stream; merging a sliding window into one MP4 isn't supported." }
+          : undefined,
+    });
     return;
   }
 
@@ -249,8 +336,13 @@ async function probeHls(stream: DetectedStream, jobId: string): Promise<void> {
     bandwidth: v.bandwidth,
     resolution: v.resolution,
     height: v.height,
+    frameRate: v.frameRate,
     codecs: v.codecs,
+    videoRange: v.videoRange,
     audioGroup: v.audioGroup,
+    // Master-level DRM applies to every variant; per-variant flag is what
+    // the picker needs so it can grey individual rows out.
+    drm: parsed.drmSystems[0],
   }));
 
   const audioTracks: AudioTrackOption[] = dedupeAudioTracks(
@@ -282,6 +374,7 @@ async function probeHls(stream: DetectedStream, jobId: string): Promise<void> {
     ? audioTracks.find((a) => a.groupId === top.audioGroup && (a.default || true))?.id
     : audioTracks.find((a) => a.default)?.id;
 
+  const drm = parsed.drmSystems.length ? [...parsed.drmSystems] : undefined;
   reportProbe(jobId, {
     variants,
     audioTracks,
@@ -289,6 +382,10 @@ async function probeHls(stream: DetectedStream, jobId: string): Promise<void> {
     singlePlaylist: false,
     recommendedVariantUri,
     recommendedAudioId,
+    drm,
+    unsupported: drm
+      ? { reason: `Content is protected (${drm.join(", ")}); the segments stay encrypted.` }
+      : undefined,
   });
 }
 
@@ -437,6 +534,14 @@ async function runDownloadHls(
   const masterSource = await fetchCanonicalHls(stream.url);
   const masterParsed = parseM3U8(masterSource.text, masterSource.url);
 
+  // Fail fast on master-level DRM. Going any further just downloads
+  // segments we can't decrypt.
+  if (masterParsed.kind === "master" && masterParsed.drmSystems.length) {
+    throw new Error(
+      `Stream is protected by ${masterParsed.drmSystems.join(", ")}; segments cannot be decrypted.`,
+    );
+  }
+
   let videoPlaylistUrl: string;
   let audioRendition: HlsRendition | undefined;
 
@@ -468,6 +573,18 @@ async function runDownloadHls(
   const videoPlaylist = parseM3U8(await fetchText(videoPlaylistUrl), videoPlaylistUrl);
   if (videoPlaylist.kind !== "media") throw new Error("Failed to resolve media playlist.");
   if (!videoPlaylist.playlist.segments.length) throw new Error("Playlist contains no segments.");
+  if (videoPlaylist.playlist.drmSystems.length) {
+    throw new Error(
+      `Media playlist references ${videoPlaylist.playlist.drmSystems.join(", ")} content protection; cannot continue.`,
+    );
+  }
+  if (videoPlaylist.playlist.liveness !== "vod") {
+    // Live windows trim segments we'd need to fetch — there's no fixed end
+    // to mux to. Bailing early is friendlier than producing a half-MP4.
+    throw new Error(
+      "Live / event playlists aren't supported; merging a sliding window into one MP4 isn't meaningful.",
+    );
+  }
 
   let audioSegments: HlsSegment[] | undefined;
   let audioInit: Uint8Array | undefined;
@@ -520,10 +637,10 @@ function canonicalHlsMasterUrl(url: string): string {
   if (!HLS_CHILD_PLAYLIST_RE.test(url)) return url;
   try {
     const u = new URL(url);
-    u.pathname = u.pathname.replace(/_(?:\d+w|audio)\.m3u8$/i, ".m3u8");
+    u.pathname = u.pathname.replace(/(_(?:\d+w|audio|video|v\d+|a\d+)|-(?:video|audio|av)\d*)\.m3u8$/i, ".m3u8");
     return u.toString();
   } catch {
-    return url.replace(/_(?:\d+w|audio)\.m3u8(\?|$|#)/i, ".m3u8$1");
+    return url.replace(/(_(?:\d+w|audio|video|v\d+|a\d+)|-(?:video|audio|av)\d*)\.m3u8(\?|$|#)/i, ".m3u8$2");
   }
 }
 
@@ -540,14 +657,16 @@ async function fetchCanonicalHls(url: string): Promise<{ url: string; text: stri
 }
 
 function deriveSiblingAudioPlaylistUrl(videoPlaylistUrl: string): string | undefined {
-  if (!/_(?:\d+w)\.m3u8(\?|$|#)/i.test(videoPlaylistUrl)) return undefined;
-  try {
-    const u = new URL(videoPlaylistUrl);
-    u.pathname = u.pathname.replace(/_\d+w\.m3u8$/i, "_audio.m3u8");
-    return u.toString();
-  } catch {
-    return videoPlaylistUrl.replace(/_\d+w\.m3u8(\?|$|#)/i, "_audio.m3u8$1");
+  if (/(_(?:\d+w|video|v\d+)|-video\d*)\.m3u8(\?|$|#)/i.test(videoPlaylistUrl)) {
+    try {
+      const u = new URL(videoPlaylistUrl);
+      u.pathname = u.pathname.replace(/(_(?:\d+w|video|v\d+)|-video\d*)\.m3u8$/i, "_audio.m3u8");
+      return u.toString();
+    } catch {
+      return videoPlaylistUrl.replace(/(_(?:\d+w|video|v\d+)|-video\d*)\.m3u8(\?|$|#)/i, "_audio.m3u8$2");
+    }
   }
+  return undefined;
 }
 
 async function fetchHlsAudioPlaylist(
@@ -561,6 +680,16 @@ async function fetchHlsAudioPlaylist(
     const text = await fetchText(url);
     const parsed = parseM3U8(text, url);
     if (parsed.kind !== "media" || !parsed.playlist.segments.length) return undefined;
+    // An encrypted or live audio rendition can't be paired with a working
+    // video track — bail before we waste bandwidth on segments we can't use.
+    if (parsed.playlist.drmSystems.length) {
+      throw new Error(
+        `Audio rendition is protected by ${parsed.playlist.drmSystems.join(", ")}.`,
+      );
+    }
+    if (parsed.playlist.liveness !== "vod") {
+      throw new Error("Audio rendition is a live / event stream — not mergeable.");
+    }
     if (!durationsCompatible(videoDuration, parsed.playlist.totalDuration)) {
       throw new Error(
         `Audio playlist duration (${parsed.playlist.totalDuration.toFixed(2)}s) does not match video (${videoDuration.toFixed(2)}s).`,
@@ -866,6 +995,7 @@ async function downloadSegmentWithRetry(
       return { bytes, retries: attempt };
     } catch (err) {
       lastErr = err;
+      if (!isRetriable(err)) break;
       if (attempt < SEGMENT_RETRIES) {
         await sleep(SEGMENT_RETRY_DELAY_MS * Math.pow(2, attempt));
       }
@@ -900,9 +1030,18 @@ function sleep(ms: number): Promise<void> {
 }
 
 /* ------------------------- ffmpeg.wasm remux ------------------------- */
+//
+// The mux step has two jobs: (1) put the video bitstream into an MP4
+// container, (2) merge the optional audio rendition. We pick filename
+// extensions that match the input bitstream so ffmpeg's demuxer auto-
+// detects without ambiguity (".bin" used to be passed in here and the
+// AAC/TS path occasionally mis-probed). For unencrypted HLS we know the
+// container from #EXT-X-MAP — fMP4 when init segment exists, MPEG-TS or
+// raw ADTS otherwise — and confirm via a magic-bytes sniff.
 
 let ffmpegPromise: Promise<import("@ffmpeg/ffmpeg").FFmpeg> | null = null;
 const ffmpegLogTail: string[] = [];
+const FFMPEG_LOG_KEEP = 60;
 
 async function getFfmpeg() {
   if (!ffmpegPromise) {
@@ -912,14 +1051,11 @@ async function getFfmpeg() {
       ff.on("log", ({ message }) => {
         if (!message) return;
         ffmpegLogTail.push(message);
-        if (ffmpegLogTail.length > 20) ffmpegLogTail.shift();
+        if (ffmpegLogTail.length > FFMPEG_LOG_KEEP) ffmpegLogTail.shift();
       });
       const coreURL = chrome.runtime.getURL("ffmpeg/ffmpeg-core.js");
       const wasmURL = chrome.runtime.getURL("ffmpeg/ffmpeg-core.wasm");
-      await ff.load({
-        coreURL,
-        wasmURL,
-      });
+      await ff.load({ coreURL, wasmURL });
       return ff;
     })();
   }
@@ -932,233 +1068,321 @@ interface RemuxOutput {
   extension: string;
 }
 
+type StreamFormat = "fmp4" | "mpegts" | "aac" | "mp3" | "unknown";
+
+/** Sniff container/codec from leading bytes — way more reliable than the
+ *  URL extension on CDNs that hand out everything as `.ts`. */
+function detectFormat(bytes: Uint8Array): StreamFormat {
+  if (bytes.byteLength >= 8) {
+    // ISO Base Media: any ftyp/styp/moov/moof box at offset 4
+    const tag = String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]);
+    if (tag === "ftyp" || tag === "styp" || tag === "moov" || tag === "moof") {
+      return "fmp4";
+    }
+  }
+  if (bytes.byteLength >= 188 && bytes[0] === 0x47 && bytes[188] === 0x47) {
+    return "mpegts";
+  }
+  if (bytes.byteLength >= 2 && bytes[0] === 0xff && (bytes[1] & 0xf0) === 0xf0) {
+    // ADTS AAC sync (0xFFF…) or MPEG audio frame sync (0xFFE…).
+    return (bytes[1] & 0x06) === 0 ? "aac" : "mp3";
+  }
+  if (bytes.byteLength >= 3 && bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) {
+    return "mp3"; // ID3-tagged MP3 (sometimes prepended to ADTS too).
+  }
+  return "unknown";
+}
+
+function extensionFor(format: StreamFormat): string {
+  switch (format) {
+    case "fmp4": return "mp4";
+    case "mpegts": return "ts";
+    case "aac": return "aac";
+    case "mp3": return "mp3";
+    default: return "bin";
+  }
+}
+
 async function remuxToPlayable(
   videoBytes: Uint8Array,
   audioBytes: Uint8Array | undefined,
   jobId: string,
 ): Promise<RemuxOutput> {
   const ff = await getFfmpeg();
-  await ff.writeFile("video.bin", videoBytes);
-  if (audioBytes) await ff.writeFile("audio.bin", audioBytes);
 
-  const attempts = audioBytes
+  const videoFmt = detectFormat(videoBytes);
+  const videoIn = `video.${extensionFor(videoFmt)}`;
+  // writeFile transfers the underlying ArrayBuffer to the worker, so the
+  // caller's view is detached after this returns. We've finished with it
+  // either way — the source-of-truth is now in MEMFS.
+  await ff.writeFile(videoIn, videoBytes);
+
+  let audioIn: string | undefined;
+  let audioFmt: StreamFormat = "unknown";
+  if (audioBytes) {
+    audioFmt = detectFormat(audioBytes);
+    audioIn = `audio.${extensionFor(audioFmt)}`;
+    await ff.writeFile(audioIn, audioBytes);
+  }
+
+  // ADTS audio inside an MP4 container needs the aac_adtstoasc bitstream
+  // filter; fMP4 audio is already AudioSpecificConfig and rejects the
+  // filter (ffmpeg errors out). MPEG-TS audio is usually ADTS-wrapped too,
+  // so apply the same filter there. MP3 / fMP4 stay as-is.
+  const needsAdtsToAsc = audioFmt === "aac" || audioFmt === "mpegts";
+  const audioCopyArgs: string[] = needsAdtsToAsc
+    ? ["-c:a", "copy", "-bsf:a", "aac_adtstoasc"]
+    : ["-c:a", "copy"];
+
+  const attempts: { args: string[]; reason: string }[] = audioIn
     ? [
-        [
-          "-i", "video.bin",
-          "-i", "audio.bin",
-          "-map", "0:v:0",
-          "-map", "1:a:0",
-          "-c", "copy",
-          "-shortest",
-        ],
-        [
-          "-i", "video.bin",
-          "-i", "audio.bin",
-          "-map", "0:v:0",
-          "-map", "1:a:0",
-          "-c", "copy",
-          "-bsf:a", "aac_adtstoasc",
-          "-shortest",
-        ],
-        [
-          "-fflags", "+genpts",
-          "-i", "video.bin",
-          "-i", "audio.bin",
-          "-map", "0:v:0",
-          "-map", "1:a:0",
-          "-c", "copy",
-          "-shortest",
-        ],
-        [
-          "-i", "video.bin",
-          "-i", "audio.bin",
-          "-map", "0:v:0",
-          "-map", "1:a:0",
-          "-c:v", "copy",
-          "-c:a", "aac",
-          "-b:a", "160k",
-          "-shortest",
-        ],
+        {
+          reason: "copy-both",
+          args: [
+            "-i", videoIn, "-i", audioIn,
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "copy", ...audioCopyArgs,
+            "-movflags", "+faststart",
+            "-shortest",
+          ],
+        },
+        {
+          // Some CDN audio renditions ship as TS-wrapped AAC; treating them
+          // as raw audio with -c copy fails. Re-encode audio as a last resort.
+          reason: "copy-video-transcode-audio",
+          args: [
+            "-i", videoIn, "-i", audioIn,
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart",
+            "-shortest",
+          ],
+        },
       ]
     : [
-        ["-i", "video.bin", "-c", "copy"],
-        ["-i", "video.bin", "-c", "copy", "-bsf:a", "aac_adtstoasc"],
+        {
+          reason: "copy-video-only",
+          args: [
+            "-i", videoIn,
+            "-c", "copy",
+            "-movflags", "+faststart",
+          ],
+        },
       ];
 
   let lastErr: unknown;
   for (let i = 0; i < attempts.length; i++) {
     const output = `output-${i}.mp4`;
+    ffmpegLogTail.length = 0;
     try {
-      const code = await ff.exec([...attempts[i], output]);
-      if (code !== 0) throw new Error(`ffmpeg exited with code ${code}`);
-      await assertPlayableOutput(ff, output, Boolean(audioBytes));
+      const code = await ff.exec([...attempts[i].args, output]);
+      if (code !== 0) {
+        throw new Error(`ffmpeg exited with code ${code} (${attempts[i].reason})`);
+      }
       const out = await ff.readFile(output);
-      if (typeof out === "string") throw new Error("ffmpeg returned text, expected binary.");
-      return { bytes: out as Uint8Array, mimeType: "video/mp4", extension: ".mp4" };
+      if (typeof out === "string") {
+        throw new Error("ffmpeg returned text, expected binary.");
+      }
+      const bytes = out as Uint8Array;
+      if (bytes.byteLength < 1024) {
+        throw new Error(`ffmpeg produced ${bytes.byteLength}-byte output (${attempts[i].reason})`);
+      }
+      return { bytes, mimeType: "video/mp4", extension: ".mp4" };
     } catch (err) {
       lastErr = err;
+      reportProgress({
+        jobId,
+        phase: "merging",
+        ratio: 0.96,
+        message: `Mux attempt "${attempts[i].reason}" failed; ${i + 1 < attempts.length ? "trying fallback" : "no more fallbacks"}.`,
+      });
     }
   }
 
-  if (audioBytes) {
-    reportProgress({
-      jobId,
-      phase: "merging",
-      ratio: 0.97,
-      message: `ffmpeg mux failed; trying Chrome MediaRecorder fallback. ${formatFfmpegError(lastErr)}`,
-    });
-    try {
-      const webm = await recordWithChromeMediaRecorder(videoBytes, audioBytes);
-      return { bytes: webm, mimeType: "video/webm", extension: ".webm" };
-    } catch (nativeErr) {
-      const nativeMsg = errorMessage(nativeErr);
-      throw new Error(
-        `Audio was downloaded, but neither ffmpeg nor Chrome MediaRecorder could mux it. ffmpeg: ${formatFfmpegError(lastErr)}. native: ${nativeMsg}`,
-      );
-    }
-  }
-
-  try {
-    reportProgress({
-      jobId,
-      phase: "merging",
-      ratio: 0.97,
-      message: `Video-only remux failed (${formatFfmpegError(lastErr)}); saving raw bytes.`,
-    });
-    return { bytes: videoBytes, mimeType: "video/mp4", extension: ".mp4" };
-  } catch {
-    return { bytes: videoBytes, mimeType: "video/mp4", extension: ".mp4" };
-  }
-}
-
-async function assertPlayableOutput(
-  ff: import("@ffmpeg/ffmpeg").FFmpeg,
-  filename: string,
-  requireAudio: boolean,
-): Promise<void> {
-  const probeFile = `${filename}.probe.txt`;
-  const code = await ff.ffprobe([
-    "-v", "error",
-    "-show_entries", "stream=codec_type",
-    "-of", "csv=p=0",
-    filename,
-    "-o", probeFile,
-  ]);
-  if (code !== 0) throw new Error(`ffprobe exited with code ${code}`);
-  const raw = await ff.readFile(probeFile, "utf8");
-  const text = typeof raw === "string" ? raw : new TextDecoder().decode(raw);
-  const streams = text.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-  if (!streams.includes("video")) throw new Error("ffmpeg output has no video track.");
-  if (requireAudio && !streams.includes("audio")) {
-    throw new Error("ffmpeg output has no audio track.");
-  }
-}
-
-async function recordWithChromeMediaRecorder(
-  videoBytes: Uint8Array,
-  audioBytes: Uint8Array,
-): Promise<Uint8Array> {
-  if (!("MediaSource" in self)) throw new Error("MediaSource is unavailable.");
-  if (!("MediaRecorder" in self)) throw new Error("MediaRecorder is unavailable.");
-
-  const videoMime = pickSupportedMime([
-    'video/mp4; codecs="avc1.64001f"',
-    'video/mp4; codecs="avc1.4d401f"',
-    'video/mp4; codecs="avc1.42e01e"',
-    'video/mp4; codecs="hvc1"',
-    "video/mp4",
-  ]);
-  const audioMime = pickSupportedMime([
-    'audio/mp4; codecs="mp4a.40.2"',
-    'audio/mp4; codecs="mp4a.40.5"',
-    "audio/mp4",
-  ]);
-  if (!videoMime || !audioMime) {
-    throw new Error("Chrome cannot append these MP4 tracks via MediaSource.");
-  }
-
-  const mediaSource = new MediaSource();
-  const video = document.createElement("video");
-  video.playsInline = true;
-  video.volume = 1;
-  video.src = URL.createObjectURL(mediaSource);
-  document.body.append(video);
-
-  try {
-    await once(mediaSource, "sourceopen");
-    const videoBuffer = mediaSource.addSourceBuffer(videoMime);
-    const audioBuffer = mediaSource.addSourceBuffer(audioMime);
-    await appendSourceBuffer(videoBuffer, videoBytes);
-    await appendSourceBuffer(audioBuffer, audioBytes);
-    mediaSource.endOfStream();
-
-    await video.play();
-    const stream = (video as HTMLVideoElement & { captureStream: () => MediaStream }).captureStream();
-    const recorderMime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")
-      ? "video/webm;codecs=vp9,opus"
-      : "video/webm";
-    const chunks: Blob[] = [];
-    const recorder = new MediaRecorder(stream, { mimeType: recorderMime });
-    recorder.ondataavailable = (event) => {
-      if (event.data.size) chunks.push(event.data);
-    };
-    const stopped = once(recorder, "stop");
-    recorder.start(1000);
-    if (!stream.getAudioTracks().length) {
-      throw new Error("MediaSource produced no audio track.");
-    }
-    await Promise.race([
-      once(video, "ended"),
-      sleep(Math.max(30_000, Math.ceil((video.duration || 0) * 1000) + 5000)),
-    ]);
-    if (recorder.state !== "inactive") recorder.stop();
-    await stopped;
-    if (!chunks.length) throw new Error("MediaRecorder produced no data.");
-    return new Uint8Array(await new Blob(chunks, { type: "video/webm" }).arrayBuffer());
-  } finally {
-    URL.revokeObjectURL(video.src);
-    video.remove();
-  }
-}
-
-function pickSupportedMime(candidates: string[]): string | undefined {
-  return candidates.find((mime) => MediaSource.isTypeSupported(mime));
-}
-
-function appendSourceBuffer(buffer: SourceBuffer, bytes: Uint8Array): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const cleanup = (): void => {
-      buffer.removeEventListener("updateend", onDone);
-      buffer.removeEventListener("error", onError);
-    };
-    const onDone = (): void => {
-      cleanup();
-      resolve();
-    };
-    const onError = (): void => {
-      cleanup();
-      reject(new Error("SourceBuffer append failed."));
-    };
-    buffer.addEventListener("updateend", onDone, { once: true });
-    buffer.addEventListener("error", onError, { once: true });
-    buffer.appendBuffer(toArrayBuffer(bytes));
-  });
-}
-
-function once(target: EventTarget, type: string): Promise<Event> {
-  return new Promise((resolve, reject) => {
-    target.addEventListener(type, resolve, { once: true });
-    target.addEventListener("error", () => reject(new Error(`${type} failed.`)), { once: true });
-  });
+  throw new Error(`Mux failed: ${formatFfmpegError(lastErr)}`);
 }
 
 function formatFfmpegError(err: unknown): string {
   const msg = errorMessage(err);
-  const log = ffmpegLogTail.slice(-6).join(" | ");
+  // Surface the tail of the ffmpeg log — that's where the demuxer or muxer
+  // explains why it gave up. Keep it bounded so the popup stays readable.
+  const log = ffmpegLogTail.slice(-12).join(" | ");
   return [msg, log].filter(Boolean).join(" — ") || "ffmpeg failed without details";
 }
 
+/* ------------------------ thumbnail extraction ------------------------ */
+//
+// Decodes a single keyframe out of the first media segment and returns it
+// as a data URL. Goal: 240px-wide JPEG, ~10–20 KB. Used by the popup as a
+// "Preview" affordance when no DOM-derived poster was available. The
+// thumbnail extraction shares the same ffmpeg.wasm instance as the merge
+// pipeline; the first call pays the wasm load tax (~2 s), subsequent
+// calls are sub-second.
+
+const THUMB_MAX_SAMPLE_BYTES = 6 * 1024 * 1024;
+
+function sendThumbResult(streamId: string, dataUrl?: string, error?: string): void {
+  void chrome.runtime
+    .sendMessage({
+      type: "thumb:result",
+      streamId,
+      dataUrl,
+      error,
+      target: "sw",
+    } satisfies RuntimeMessage)
+    .catch(() => {
+      /* popup may be closed; SW still caches the result */
+    });
+}
+
+async function runThumbnail(stream: DetectedStream): Promise<string> {
+  const sample = await sampleStreamBytes(stream);
+  if (!sample) throw new Error("Could not read a media sample.");
+  return await extractThumbJpeg(sample.bytes, sample.format);
+}
+
+interface StreamSample {
+  bytes: Uint8Array;
+  format: StreamFormat;
+}
+
+async function sampleStreamBytes(stream: DetectedStream): Promise<StreamSample | undefined> {
+  if (stream.kind === "hls") return await sampleHls(stream);
+  if (stream.kind === "dash") return await sampleDash(stream);
+  if (stream.kind === "mp4" || stream.kind === "audio") {
+    // For direct files: a leading byte-range is enough for ffmpeg to find
+    // the first keyframe in `moov`-at-front MP4s. CDN-served `audio/*`
+    // files get the same treatment — the muxer can decode a few hundred
+    // ms even from an MP3/AAC mid-stream.
+    const bytes = await fetchBytes(stream.url, {
+      Range: `bytes=0-${THUMB_MAX_SAMPLE_BYTES - 1}`,
+    }).catch(() => fetchBytes(stream.url));
+    return { bytes, format: detectFormat(bytes) };
+  }
+  return undefined;
+}
+
+async function sampleHls(stream: DetectedStream): Promise<StreamSample | undefined> {
+  const playlistText = await fetchText(stream.url);
+  const parsed = parseM3U8(playlistText, stream.url);
+
+  let mediaUrl = stream.url;
+  if (parsed.kind === "master") {
+    if (parsed.drmSystems.length || !parsed.variants.length) return undefined;
+    // Pick the *lowest* rendition we can find — frame extraction only needs
+    // one keyframe and the lowest variant is fastest to fetch.
+    const sorted = [...parsed.variants].sort(compareVariantsBest);
+    const lowest = sorted[sorted.length - 1] ?? sorted[0];
+    if (!lowest) return undefined;
+    mediaUrl = lowest.uri;
+  }
+
+  const mediaText = parsed.kind === "media" ? playlistText : await fetchText(mediaUrl);
+  const media = parseM3U8(mediaText, mediaUrl);
+  if (media.kind !== "media" || !media.playlist.segments.length) return undefined;
+  if (media.playlist.drmSystems.length) return undefined;
+
+  const initBytes = media.playlist.initSegment
+    ? await fetchInitSegment(media.playlist.initSegment).catch(() => undefined)
+    : undefined;
+
+  const firstSeg = media.playlist.segments[0];
+  let segBytes = await fetchSegmentBytes(firstSeg);
+  if (firstSeg.key) {
+    // Resolve the AES-128 key just for this segment.
+    const keyBytes = await fetchBytes(firstSeg.key.uri).catch(() => undefined);
+    if (!keyBytes) return undefined;
+    const iv = ivForSequence(firstSeg.key.iv, firstSeg.sequence);
+    segBytes = await decryptAes128(segBytes, keyBytes, iv);
+  }
+
+  const merged = initBytes ? concatBytes(initBytes, segBytes) : segBytes;
+  return { bytes: merged, format: detectFormat(merged) };
+}
+
+async function sampleDash(stream: DetectedStream): Promise<StreamSample | undefined> {
+  const text = await fetchText(stream.url);
+  const mpd = parseMpd(text, stream.url);
+  const set = mpd.videoSets[0];
+  if (!set || !set.representations.length) return undefined;
+  // Lowest-bandwidth rep — fastest single-segment fetch.
+  const rep = [...set.representations].sort((a, b) => a.bandwidth - b.bandwidth)[0];
+  if (!rep || !rep.segments.length) return undefined;
+  const initBytes = rep.initUrl
+    ? await fetchBytes(rep.initUrl).catch(() => undefined)
+    : undefined;
+  const segBytes = await fetchBytes(rep.segments[0].uri);
+  const merged = initBytes ? concatBytes(initBytes, segBytes) : segBytes;
+  return { bytes: merged, format: detectFormat(merged) };
+}
+
+async function fetchSegmentBytes(seg: HlsSegment): Promise<Uint8Array> {
+  const headers: Record<string, string> = {};
+  if (seg.byteRange) {
+    headers.Range = `bytes=${seg.byteRange.offset}-${seg.byteRange.offset + seg.byteRange.length - 1}`;
+  }
+  return fetchBytes(seg.uri, headers);
+}
+
+function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
+  const out = new Uint8Array(a.byteLength + b.byteLength);
+  out.set(a, 0);
+  out.set(b, a.byteLength);
+  return out;
+}
+
+async function extractThumbJpeg(bytes: Uint8Array, format: StreamFormat): Promise<string> {
+  const ff = await getFfmpeg();
+  const inputName = `thumb-in.${extensionFor(format)}`;
+  const outputName = "thumb-out.jpg";
+  ffmpegLogTail.length = 0;
+  await ff.writeFile(inputName, bytes);
+  // -ss 0 + -frames:v 1 yields the first decodable frame; -an drops audio
+  // streams (some MP3-only "video" files would otherwise demux as audio).
+  const code = await ff.exec([
+    "-i", inputName,
+    "-an",
+    "-frames:v", "1",
+    "-vf", "scale=240:-2",
+    "-q:v", "5",
+    outputName,
+  ]);
+  if (code !== 0) {
+    throw new Error(`ffmpeg thumb extraction failed: ${formatFfmpegError(undefined)}`);
+  }
+  const out = await ff.readFile(outputName);
+  if (typeof out === "string") throw new Error("ffmpeg returned text, expected JPEG.");
+  const jpeg = out as Uint8Array;
+  if (jpeg.byteLength < 100) {
+    throw new Error(`ffmpeg produced a ${jpeg.byteLength}-byte thumb (likely empty).`);
+  }
+  // ffmpeg.wasm's MEMFS retains files between calls; clean up so a long
+  // session doesn't accumulate megabytes of stale thumbnails.
+  await ff.deleteFile(inputName).catch(() => {});
+  await ff.deleteFile(outputName).catch(() => {});
+  return `data:image/jpeg;base64,${bytesToBase64(jpeg)}`;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.byteLength; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
 function errorMessage(err: unknown): string {
+  if (err instanceof HttpStatusError) {
+    return `${err.message} for ${err.url}`;
+  }
+  if (err instanceof FetchTimeoutError) {
+    return `Network timeout (${err.ms}ms) for ${err.url}`;
+  }
+  if (err instanceof FetchAbortedError) {
+    return `Network request aborted: ${err.url}`;
+  }
   if (err instanceof Error && err.message) return err.message;
   if (typeof err === "string" && err.trim()) return err;
   try {
@@ -1168,6 +1392,15 @@ function errorMessage(err: unknown): string {
     /* ignore */
   }
   return String(err || "unknown");
+}
+
+/** A 4xx response will not magically heal between attempts; retrying just
+ *  delays the inevitable. 5xx and network/timeout errors are worth retrying. */
+function isRetriable(err: unknown): boolean {
+  if (err instanceof HttpStatusError) return err.status >= 500 || err.status === 408 || err.status === 429;
+  if (err instanceof FetchTimeoutError) return true;
+  if (err instanceof FetchAbortedError) return false; // user/system aborted
+  return true; // unknown network glitch — give it another shot
 }
 
 function withExtension(filename: string, extension: string): string {

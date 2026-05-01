@@ -1,6 +1,7 @@
 /**
  * HLS playlist parser. Handles:
- *   - master playlist (#EXT-X-STREAM-INF) with all variant attrs
+ *   - master playlist (#EXT-X-STREAM-INF) with all variant attrs incl.
+ *     VIDEO-RANGE (SDR/HLG/PQ — i.e. HDR signal) and FRAME-RATE
  *   - alternate renditions (#EXT-X-MEDIA TYPE=AUDIO/SUBTITLES/VIDEO)
  *   - media playlist with relative or absolute URIs
  *   - byte-range segments (#EXT-X-BYTERANGE)
@@ -9,8 +10,16 @@
  *   - #EXT-X-MEDIA-SEQUENCE (required to compute the default IV per RFC 8216
  *     §5.2 when an explicit IV attribute is absent — using array index would
  *     decrypt to garbage on any stream where MEDIA-SEQUENCE != 0)
+ *   - DRM hints (#EXT-X-SESSION-KEY at master level + non-AES-128 #EXT-X-KEY
+ *     in media playlists), classified via KEYFORMAT — FairPlay / Widevine /
+ *     PlayReady / ClearKey. We do NOT implement the EME flow; classification
+ *     lets the SW fail early with a human-readable message instead of
+ *     downloading 200 segments and producing garbage MP4.
+ *   - Live vs VOD distinction (#EXT-X-PLAYLIST-TYPE + presence of
+ *     #EXT-X-ENDLIST per RFC 8216 §4.3.3.4-5). A live playlist's segment
+ *     list slides; merging it into a single MP4 makes no sense.
  *
- * Still NOT handled: SAMPLE-AES.
+ * Still NOT handled: SAMPLE-AES playback (we only detect-and-bail).
  */
 
 export interface HlsKey {
@@ -18,6 +27,24 @@ export interface HlsKey {
   uri: string;
   iv?: Uint8Array;
 }
+
+/** HLS dynamic-range signal — see RFC 8216-bis VIDEO-RANGE attribute. */
+export type HlsVideoRange = "SDR" | "HLG" | "PQ";
+
+/**
+ * DRM systems we can recognise from KEYFORMAT. We never decrypt these — the
+ * point of recognising them is to refuse the job up-front.
+ */
+export type HlsDrmSystem =
+  | "fairplay"
+  | "widevine"
+  | "playready"
+  | "clearkey"
+  | "unknown";
+
+/** Default-IV-only AES-128 encrypts segments with a key the parser CAN fetch.
+ *  Anything else is content-protection that requires an EME flow. */
+export type HlsLiveness = "vod" | "event" | "live";
 
 export interface HlsByteRange {
   length: number;
@@ -49,6 +76,10 @@ export interface HlsMediaPlaylist {
   initSegment?: HlsInitSegment;
   /** Media Sequence Number of the first segment. Defaults to 0 per spec. */
   mediaSequence: number;
+  /** vod / event / live — see HlsLiveness. Defaults to vod when ENDLIST present. */
+  liveness: HlsLiveness;
+  /** DRM systems referenced by any non-AES-128 #EXT-X-KEY in this playlist. */
+  drmSystems: HlsDrmSystem[];
 }
 
 export interface HlsVariant {
@@ -56,7 +87,11 @@ export interface HlsVariant {
   resolution?: string;
   /** Pixel height parsed out of resolution; 0 when unknown. */
   height: number;
+  /** Decoded frame rate from FRAME-RATE; undefined when omitted. */
+  frameRate?: number;
   codecs?: string;
+  /** SDR / HLG / PQ. Undefined → assume SDR per spec when absent. */
+  videoRange?: HlsVideoRange;
   uri: string;
   audioGroup?: string;
   subtitleGroup?: string;
@@ -72,7 +107,13 @@ export interface HlsRendition {
 }
 
 export type HlsParseResult =
-  | { kind: "master"; variants: HlsVariant[]; renditions: HlsRendition[] }
+  | {
+      kind: "master";
+      variants: HlsVariant[];
+      renditions: HlsRendition[];
+      /** DRM seen via #EXT-X-SESSION-KEY at the master level. */
+      drmSystems: HlsDrmSystem[];
+    }
   | { kind: "media"; playlist: HlsMediaPlaylist };
 
 const ATTR_RE = /([A-Z0-9-]+)=("[^"]*"|[^,]*)/gi;
@@ -106,6 +147,50 @@ function parseHeight(resolution: string | undefined): number {
   return m ? Number(m[2]) || 0 : 0;
 }
 
+function parseVideoRange(value: string | undefined): HlsVideoRange | undefined {
+  if (!value) return undefined;
+  const v = value.toUpperCase();
+  if (v === "SDR" || v === "HLG" || v === "PQ") return v;
+  return undefined;
+}
+
+function parseFrameRate(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const n = parseFloat(value);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+/**
+ * Recognise a DRM system from a KEYFORMAT URI. The values below are the
+ * stable identifiers published by each DRM provider — they are part of the
+ * HLS spec / public DASH-IF guidelines, not vendor IP. We only classify;
+ * the segments stay encrypted and the SW will refuse the job.
+ */
+function classifyDrm(keyformat: string | undefined, method: string | undefined): HlsDrmSystem | null {
+  // AES-128 with default identity KEYFORMAT — handled natively by the
+  // existing HlsKey path. Don't tag it as DRM.
+  const m = (method || "").toUpperCase();
+  if (m === "AES-128") return null;
+  if (m === "NONE") return null;
+
+  const kf = (keyformat || "").toLowerCase();
+  if (!kf || kf === "identity") {
+    // Method !== AES-128 with identity KEYFORMAT shouldn't really happen,
+    // but if it does we still can't safely play it.
+    return "unknown";
+  }
+  if (kf.includes("apple.streamingkeydelivery")) return "fairplay";
+  if (kf.includes("microsoft.playready")) return "playready";
+  // Widevine + DASH-IF use this specific UUID.
+  if (kf.includes("edef8ba9-79d6-4ace-a3c8-27dcd51d21ed")) return "widevine";
+  if (kf.includes("urn:uuid:e2719d58-a985-b3c9-781a-b030af78d30e")) return "clearkey";
+  return "unknown";
+}
+
+function pushUnique<T>(list: T[], v: T): void {
+  if (!list.includes(v)) list.push(v);
+}
+
 function resolveUri(base: string, ref: string): string {
   return new URL(ref, base).toString();
 }
@@ -122,6 +207,8 @@ export function parseM3U8(text: string, baseUrl: string): HlsParseResult {
   const variants: HlsVariant[] = [];
   const renditions: HlsRendition[] = [];
   const segments: HlsSegment[] = [];
+  const sessionDrm: HlsDrmSystem[] = [];
+  const mediaDrm: HlsDrmSystem[] = [];
   let currentKey: HlsKey | undefined;
   let initSegment: HlsInitSegment | undefined;
   let pendingDuration = 0;
@@ -129,6 +216,8 @@ export function parseM3U8(text: string, baseUrl: string): HlsParseResult {
   let lastEndOffset = 0;
   let isMaster = false;
   let mediaSequence = 0;
+  let endListSeen = false;
+  let playlistType: "VOD" | "EVENT" | undefined;
 
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i];
@@ -145,13 +234,24 @@ export function parseM3U8(text: string, baseUrl: string): HlsParseResult {
           bandwidth: Number(attrs.BANDWIDTH || 0),
           resolution,
           height: parseHeight(resolution),
+          frameRate: parseFrameRate(attrs["FRAME-RATE"]),
           codecs: attrs.CODECS,
+          videoRange: parseVideoRange(attrs["VIDEO-RANGE"]),
           uri: resolveUri(baseUrl, next),
           audioGroup: attrs.AUDIO,
           subtitleGroup: attrs.SUBTITLES,
         });
         i++;
       }
+      continue;
+    }
+
+    if (line.startsWith("#EXT-X-SESSION-KEY:")) {
+      // Master-level DRM hint. Carries no segment URI but tells us the
+      // content is protected before we even fetch a media playlist.
+      const attrs = parseAttrs(line.slice("#EXT-X-SESSION-KEY:".length));
+      const sys = classifyDrm(attrs.KEYFORMAT, attrs.METHOD);
+      if (sys) pushUnique(sessionDrm, sys);
       continue;
     }
 
@@ -181,7 +281,25 @@ export function parseM3U8(text: string, baseUrl: string): HlsParseResult {
           uri: resolveUri(baseUrl, attrs.URI),
           iv: attrs.IV ? hexToBytes(attrs.IV) : undefined,
         };
+      } else {
+        // SAMPLE-AES, SAMPLE-AES-CTR, etc. — content protection we cannot
+        // satisfy. Tag it and drop the AES-128 path so callers don't try
+        // to "decrypt" with a key we never fetched.
+        const sys = classifyDrm(attrs.KEYFORMAT, attrs.METHOD);
+        if (sys) pushUnique(mediaDrm, sys);
+        currentKey = undefined;
       }
+      continue;
+    }
+
+    if (line === "#EXT-X-ENDLIST") {
+      endListSeen = true;
+      continue;
+    }
+
+    if (line.startsWith("#EXT-X-PLAYLIST-TYPE:")) {
+      const v = line.slice("#EXT-X-PLAYLIST-TYPE:".length).trim().toUpperCase();
+      if (v === "VOD" || v === "EVENT") playlistType = v;
       continue;
     }
 
@@ -235,11 +353,27 @@ export function parseM3U8(text: string, baseUrl: string): HlsParseResult {
 
   if (isMaster) {
     variants.sort(compareVariantsBest);
-    return { kind: "master", variants, renditions };
+    return { kind: "master", variants, renditions, drmSystems: sessionDrm };
   }
   const totalDuration = segments.reduce((acc, s) => acc + s.duration, 0);
+  // RFC 8216 §6.2.1: ENDLIST marks a finished VOD-style playlist; an explicit
+  // PLAYLIST-TYPE=VOD also implies it. EVENT is "growing but never trims" —
+  // still a sliding window in practice, treat it as live for our purposes.
+  const liveness: HlsLiveness =
+    playlistType === "VOD" || endListSeen
+      ? "vod"
+      : playlistType === "EVENT"
+        ? "event"
+        : "live";
   return {
     kind: "media",
-    playlist: { segments, totalDuration, initSegment, mediaSequence },
+    playlist: {
+      segments,
+      totalDuration,
+      initSegment,
+      mediaSequence,
+      liveness,
+      drmSystems: mediaDrm,
+    },
   };
 }

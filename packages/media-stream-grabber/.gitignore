@@ -4,3 +4,6 @@ dist.zip
 *.log
 .DS_Store
 .vite/
+key.pem
+public/ffmpeg/
+

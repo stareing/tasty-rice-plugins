@@ -1,3 +1,4 @@
+import { siteFilenameHint } from "./siteRules";
 import type { StreamKind } from "./types";
 
 const HLS_PATTERNS = [/\.m3u8(\?|$|#)/i, /application\/(vnd\.apple\.)?mpegurl/i];
@@ -50,24 +51,38 @@ function extensionFor(kind: StreamKind, fallbackUrl: string): string {
   return m ? `.${m[1].toLowerCase()}` : "";
 }
 
+function withExt(slug: string, ext: string): string {
+  return ext && !slug.toLowerCase().endsWith(ext) ? `${slug}${ext}` : slug;
+}
+
 /**
- * Build a sane filename. Prefer the page title (slugified) so the user sees
- * a meaningful name; fall back to the URL basename. HLS / DASH always end .mp4.
+ * Build a sane filename. Preference order:
+ *   1. Page title (slugified) — usually the most meaningful.
+ *   2. Site-rule hint (e.g. "YouTube - dQw4w9WgXcQ") when the page URL maps
+ *      to a known site — covers titleless tabs and embedded players.
+ *   3. URL basename, stripped of `.m3u8` / `.mpd` suffixes.
+ * HLS / DASH always end .mp4.
  */
 export function suggestedFilename(
   url: string,
   kind: StreamKind,
   pageTitle?: string,
+  pageUrl?: string,
 ): string {
   const ext = extensionFor(kind, url);
   if (pageTitle) {
     const slug = slugify(pageTitle);
-    if (slug) return ext && !slug.toLowerCase().endsWith(ext) ? `${slug}${ext}` : slug;
+    if (slug) return withExt(slug, ext);
+  }
+  const hint = siteFilenameHint(pageUrl);
+  if (hint) {
+    const slug = slugify(hint);
+    if (slug) return withExt(slug, ext);
   }
   const base = urlBasename(url) || "stream";
   const stripped = base.replace(/\.(m3u8|mpd)(\?.*)?$/i, "");
   const slug = slugify(stripped) || "stream";
-  return ext && !slug.toLowerCase().endsWith(ext) ? `${slug}${ext}` : slug;
+  return withExt(slug, ext);
 }
 
 /** djb2 hash → base36; cheap, no crypto needed. */

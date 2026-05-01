@@ -36,6 +36,24 @@ const KIND_LABEL: Record<StreamKind, string> = {
   other: "FILE",
 };
 
+type CategoryKey = "all" | "video" | "audio" | "image";
+
+const VIDEO_KINDS: ReadonlySet<StreamKind> = new Set(["hls", "dash", "mp4"]);
+
+function categoryOf(kind: StreamKind): Exclude<CategoryKey, "all"> | null {
+  if (VIDEO_KINDS.has(kind)) return "video";
+  if (kind === "audio") return "audio";
+  if (kind === "image") return "image";
+  return null;
+}
+
+const CATEGORIES: { key: CategoryKey; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "video", label: "Video" },
+  { key: "audio", label: "Audio" },
+  { key: "image", label: "Image" },
+];
+
 interface PendingPicker {
   jobId: string;
   stream: DetectedStream;
@@ -49,6 +67,9 @@ export function App(): JSX.Element {
   const [picker, setPicker] = useState<PendingPicker | null>(null);
   const [armedUntil, setArmedUntil] = useState<number>(0);
   const [now, setNow] = useState<number>(() => Date.now());
+  const [thumbsRequesting, setThumbsRequesting] = useState<Set<string>>(() => new Set());
+  const [sniffActive, setSniffActive] = useState<boolean>(false);
+  const [category, setCategory] = useState<CategoryKey>("all");
   const jobToStreamRef = useRef<Map<string, string>>(new Map());
 
   const refresh = useCallback(async () => {
@@ -63,6 +84,23 @@ export function App(): JSX.Element {
     void refresh();
   }, [refresh]);
 
+  // Pull the current page-sniff state once on mount. Subsequent state changes
+  // (toggle, navigation-driven auto-disable) arrive via `pagesniff:status`
+  // broadcasts in the listener below.
+  useEffect(() => {
+    if (!tab?.id) return;
+    void send<RuntimeMessage>({ type: "pagesniff:query", tabId: tab.id }).then(
+      (resp) => {
+        if (resp && (resp as RuntimeMessage).type === "pagesniff:status") {
+          setSniffActive(
+            (resp as Extract<RuntimeMessage, { type: "pagesniff:status" }>)
+              .active,
+          );
+        }
+      },
+    );
+  }, [tab?.id]);
+
   useEffect(() => {
     const handler = (msg: RuntimeMessage) => {
       // CLAUDE.md cross-context convention: every context early-returns on
@@ -70,9 +108,40 @@ export function App(): JSX.Element {
       // broadcasts (status updates, probe results, fresh stream rows).
       if (msg.target && msg.target !== "sw") return;
       if (msg.type === "streams:added" && tab?.id && msg.tabId === tab.id) {
-        setStreams((prev) =>
-          prev.some((s) => s.id === msg.stream.id) ? prev : [msg.stream, ...prev],
-        );
+        setStreams((prev) => {
+          // Merge by id; the SW may re-emit `streams:added` for the same id
+          // (e.g. when a sibling child playlist is sniffed and dedupes).
+          const idx = prev.findIndex((s) => s.id === msg.stream.id);
+          if (idx >= 0) {
+            const next = [...prev];
+            next[idx] = { ...next[idx], ...msg.stream };
+            return next;
+          }
+          return [msg.stream, ...prev];
+        });
+      }
+      if (msg.type === "thumb:result" && msg.dataUrl) {
+        setStreams((prev) => {
+          const idx = prev.findIndex((s) => s.id === msg.streamId);
+          if (idx < 0) return prev;
+          const next = [...prev];
+          next[idx] = { ...next[idx], thumbDataUrl: msg.dataUrl };
+          return next;
+        });
+        setThumbsRequesting((prev) => {
+          if (!prev.has(msg.streamId)) return prev;
+          const next = new Set(prev);
+          next.delete(msg.streamId);
+          return next;
+        });
+      }
+      if (msg.type === "thumb:result" && msg.error) {
+        setThumbsRequesting((prev) => {
+          if (!prev.has(msg.streamId)) return prev;
+          const next = new Set(prev);
+          next.delete(msg.streamId);
+          return next;
+        });
       }
       if (msg.type === "download:progress") {
         setProgress((prev) => ({ ...prev, [msg.payload.jobId]: msg.payload }));
@@ -80,11 +149,25 @@ export function App(): JSX.Element {
       if (msg.type === "capture:status" && tab?.id && msg.tabId === tab.id) {
         setArmedUntil(msg.armedUntil);
       }
+      if (
+        msg.type === "pagesniff:status" &&
+        tab?.id &&
+        msg.tabId === tab.id
+      ) {
+        setSniffActive(msg.active);
+      }
       if (msg.type === "download:probe:result") {
         setPicker((prev) => {
           if (!prev || prev.jobId !== msg.jobId) return prev;
-          // If the probe came back with no choices, auto-start.
-          if (msg.result.singlePlaylist || msg.result.variants.length === 0) {
+          // Probe-time refusal: live, DRM, or otherwise unfit. Keep the
+          // modal open so the user sees *why* — auto-starting would just
+          // produce a download:progress error a beat later.
+          const refused = msg.result.unsupported || msg.result.isLive;
+          // If the probe came back with no choices and is fine, auto-start.
+          if (
+            !refused &&
+            (msg.result.singlePlaylist || msg.result.variants.length === 0)
+          ) {
             void send({
               type: "download:start",
               stream: prev.stream,
@@ -115,6 +198,19 @@ export function App(): JSX.Element {
       setArmedUntil((resp as Extract<RuntimeMessage, { type: "capture:status" }>).armedUntil);
     }
   }, [tab?.id]);
+
+  const onToggleSniff = useCallback(async () => {
+    if (!tab?.id) return;
+    const next = !sniffActive;
+    // Optimistic flip — the SW broadcast will reconcile if anything
+    // (e.g. a parallel popup, an auto-disable on navigation) disagrees.
+    setSniffActive(next);
+    await send({
+      type: "pagesniff:toggle",
+      tabId: tab.id,
+      enable: next,
+    });
+  }, [tab?.id, sniffActive]);
 
   // Tick the countdown while the capture window is open. The interval is cheap
   // and only mounts while the popup is visible.
@@ -161,6 +257,16 @@ export function App(): JSX.Element {
     await send({ type: "download:cancel", jobId });
   }, []);
 
+  const onRequestThumb = useCallback(async (stream: DetectedStream) => {
+    if (thumbsRequesting.has(stream.id)) return;
+    setThumbsRequesting((prev) => {
+      const next = new Set(prev);
+      next.add(stream.id);
+      return next;
+    });
+    await send({ type: "thumb:request", streamId: stream.id, stream });
+  }, [thumbsRequesting]);
+
   const onPickerConfirm = useCallback(
     async (selection: DownloadSelection) => {
       if (!picker) return;
@@ -196,6 +302,20 @@ export function App(): JSX.Element {
     return map;
   }, [progress]);
 
+  const counts = useMemo(() => {
+    const c = { all: streams.length, video: 0, audio: 0, image: 0 };
+    for (const s of streams) {
+      const cat = categoryOf(s.kind);
+      if (cat) c[cat]++;
+    }
+    return c;
+  }, [streams]);
+
+  const visibleStreams = useMemo(() => {
+    if (category === "all") return streams;
+    return streams.filter((s) => categoryOf(s.kind) === category);
+  }, [streams, category]);
+
   return (
     <div className="app">
       <header className="app__header">
@@ -203,12 +323,28 @@ export function App(): JSX.Element {
         <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
           <span className="app__count">{streams.length} found</span>
           <button
+            className={`app__btn${sniffActive ? " app__btn--active" : ""}`}
+            onClick={onToggleSniff}
+            disabled={!tab?.id}
+            title={
+              sniffActive
+                ? "Stop capturing every media request on this tab."
+                : "Capture every media request on this tab until you stop or the page navigates. Includes images."
+            }
+          >
+            {sniffActive ? "Stop sniffing" : "Sniff page"}
+          </button>
+          <button
             className="app__btn"
             onClick={onArm}
-            disabled={!tab?.id || isArmed}
-            title="Arm a 30s capture window for this tab. Nothing is sniffed otherwise."
+            disabled={!tab?.id || isArmed || sniffActive}
+            title={
+              sniffActive
+                ? "Page-sniff is on — broader capture is already active."
+                : "Arm a 30s capture window for this tab. Nothing is sniffed otherwise."
+            }
           >
-            {isArmed ? `Capturing… ${armedSecondsLeft}s` : "Arm capture"}
+            {isArmed ? `Capturing… ${armedSecondsLeft}s` : "Arm 30s"}
           </button>
           <button className="app__btn" onClick={onClear} disabled={!streams.length}>
             Clear
@@ -216,18 +352,34 @@ export function App(): JSX.Element {
         </div>
       </header>
 
+      <nav className="cats" role="tablist" aria-label="Filter by media type">
+        {CATEGORIES.map((c) => (
+          <button
+            key={c.key}
+            role="tab"
+            aria-selected={category === c.key}
+            className={`cats__btn${category === c.key ? " cats__btn--active" : ""}`}
+            onClick={() => setCategory(c.key)}
+          >
+            {c.label}
+            <span className="cats__count">{counts[c.key]}</span>
+          </button>
+        ))}
+      </nav>
+
       {streams.length === 0 ? (
         <div className="empty">
           Nothing captured on this tab.
           <br />
-          Right-click anywhere on the page and pick
+          Click <strong>Sniff page</strong> for whole-page capture, or right-click
+          a video and pick
           <br />
-          <strong>Media Stream Grabber → Capture next 30s of media</strong>,
-          <br />
-          then play the video.
+          <strong>Media Stream Grabber → Capture next 30s of media</strong>.
         </div>
+      ) : visibleStreams.length === 0 ? (
+        <div className="empty">No {category} captured on this tab.</div>
       ) : (
-        streams.map((s) => {
+        visibleStreams.map((s) => {
           const job = [...jobToStreamRef.current.entries()].find(([, sid]) => sid === s.id);
           const jobId = job?.[0];
           return (
@@ -235,9 +387,11 @@ export function App(): JSX.Element {
               key={s.id}
               stream={s}
               progress={progressByStream[s.id]}
+              thumbLoading={thumbsRequesting.has(s.id)}
               onCopy={() => onCopy(s.url)}
               onDownload={() => onDownload(s)}
               onCancel={jobId ? () => onCancel(jobId) : undefined}
+              onRequestThumb={() => onRequestThumb(s)}
             />
           );
         })
@@ -257,33 +411,62 @@ export function App(): JSX.Element {
 function StreamCard({
   stream,
   progress,
+  thumbLoading,
   onCopy,
   onDownload,
   onCancel,
+  onRequestThumb,
 }: {
   stream: DetectedStream;
   progress?: DownloadProgress;
+  thumbLoading: boolean;
   onCopy: () => void;
   onDownload: () => void;
   onCancel?: () => void;
+  onRequestThumb: () => void;
 }): JSX.Element {
   const tagClass = `stream__tag stream__tag--${stream.kind}`;
   const inFlight = progress && progress.phase !== "done" && progress.phase !== "error";
   const ratio = Math.max(0, Math.min(1, progress?.ratio ?? 0));
+  // For images we just render the resource URL itself — no ffmpeg round
+  // trip needed. Everything else uses the ffmpeg-extracted first frame
+  // (auto-enqueued by the SW; the "Preview" button is a manual retry).
+  const thumbSrc =
+    stream.kind === "image" ? stream.url : stream.thumbDataUrl;
+  const canExtract = stream.kind === "hls" || stream.kind === "dash" || stream.kind === "mp4" || stream.kind === "audio";
+  const showPreviewButton = !stream.thumbDataUrl && canExtract;
 
   return (
     <div className="stream">
-      <div className="stream__head">
-        <span className={tagClass}>{KIND_LABEL[stream.kind]}</span>
-        <span className="stream__name" title={stream.suggestedName}>
-          {stream.suggestedName}
-        </span>
+      <div className="stream__body">
+        <div className={`stream__thumb${thumbSrc ? "" : " stream__thumb--placeholder"}`}>
+          {thumbSrc ? (
+            <img src={thumbSrc} alt="" loading="lazy" referrerPolicy="no-referrer" onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }} />
+          ) : thumbLoading ? (
+            <span className="stream__thumb-label">…</span>
+          ) : (
+            <span className="stream__thumb-label">{KIND_LABEL[stream.kind]}</span>
+          )}
+        </div>
+        <div className="stream__meta">
+          <div className="stream__head">
+            <span className={tagClass}>{KIND_LABEL[stream.kind]}</span>
+            <span className="stream__name" title={stream.suggestedName}>
+              {stream.suggestedName}
+            </span>
+          </div>
+          <p className="stream__url" title={stream.url}>
+            {stream.url}
+          </p>
+        </div>
       </div>
-      <p className="stream__url" title={stream.url}>
-        {stream.url}
-      </p>
       <div className="stream__actions">
         <button onClick={onCopy}>Copy URL</button>
+        {showPreviewButton ? (
+          <button onClick={onRequestThumb} disabled={thumbLoading}>
+            {thumbLoading ? "Extracting…" : "Preview"}
+          </button>
+        ) : null}
         {inFlight && onCancel ? (
           <button onClick={onCancel}>Cancel</button>
         ) : (
@@ -332,20 +515,38 @@ function PickerModal({
   onConfirm: (sel: DownloadSelection) => void;
   onCancel: () => void;
 }): JSX.Element {
-  const { variants, audioTracks, subtitleTracks, recommendedVariantUri, recommendedAudioId } =
-    picker.result;
-  const [variantUri, setVariantUri] = useState<string | undefined>(recommendedVariantUri);
+  const {
+    variants,
+    audioTracks,
+    subtitleTracks,
+    recommendedVariantUri,
+    recommendedAudioId,
+    isLive,
+    unsupported,
+  } = picker.result;
+  const playableVariants = variants.filter((v) => !v.drm);
+  const [variantUri, setVariantUri] = useState<string | undefined>(
+    recommendedVariantUri && playableVariants.some((v) => v.uri === recommendedVariantUri)
+      ? recommendedVariantUri
+      : playableVariants[0]?.uri,
+  );
   const [audioId, setAudioId] = useState<string | undefined>(recommendedAudioId);
   const [subtitleId, setSubtitleId] = useState<string | undefined>(undefined);
 
   useEffect(() => {
-    if (!variantUri && variants[0]) setVariantUri(variants[0].uri);
-  }, [variants, variantUri]);
+    if (!variantUri && playableVariants[0]) setVariantUri(playableVariants[0].uri);
+  }, [playableVariants, variantUri]);
   useEffect(() => {
     if (!audioId && audioTracks[0]) setAudioId(audioTracks[0].id);
   }, [audioTracks, audioId]);
 
-  const probing = !variants.length && !audioTracks.length && !subtitleTracks.length;
+  const probing =
+    !variants.length &&
+    !audioTracks.length &&
+    !subtitleTracks.length &&
+    !unsupported &&
+    !isLive;
+  const blocked = !!unsupported || !!isLive || (variants.length > 0 && playableVariants.length === 0);
 
   return (
     <div className="modal">
@@ -357,6 +558,13 @@ function PickerModal({
 
         {probing ? (
           <div className="modal__probing">Probing playlist…</div>
+        ) : blocked ? (
+          <div className="modal__probing modal__probing--error">
+            {unsupported?.reason ||
+              (isLive
+                ? "This is a live or event stream; merging a sliding window into one MP4 isn't supported."
+                : "Every rendition in this manifest is DRM-protected.")}
+          </div>
         ) : (
           <>
             {variants.length > 0 ? (
@@ -417,14 +625,16 @@ function PickerModal({
         )}
 
         <div className="modal__actions">
-          <button onClick={onCancel}>Cancel</button>
-          <button
-            className="primary"
-            disabled={probing}
-            onClick={() => onConfirm({ variantUri, audioId, subtitleId })}
-          >
-            Download
-          </button>
+          <button onClick={onCancel}>{blocked ? "Close" : "Cancel"}</button>
+          {blocked ? null : (
+            <button
+              className="primary"
+              disabled={probing || !variantUri}
+              onClick={() => onConfirm({ variantUri, audioId, subtitleId })}
+            >
+              Download
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -445,21 +655,34 @@ function VariantRow({
   const label = variant.height
     ? `${variant.height}p`
     : variant.resolution || "unknown";
+  const fps =
+    variant.frameRate && variant.frameRate >= 1
+      ? `${Math.round(variant.frameRate)}`
+      : null;
   const mbps = variant.bandwidth
     ? ` · ${(variant.bandwidth / 1_000_000).toFixed(2)} Mbps`
     : "";
   const codec = variant.codecs ? ` · ${variant.codecs}` : "";
+  // VIDEO-RANGE: HLS marks PQ for HDR10 / HLG for hybrid log-gamma. SDR is
+  // the default and not worth a badge.
+  const hdr = variant.videoRange && variant.videoRange !== "SDR" ? variant.videoRange : null;
+  const drm = variant.drm ? variant.drm.toUpperCase() : null;
   return (
     <button
-      className={`row${selected ? " row--selected" : ""}`}
-      onClick={onPick}
+      className={`row${selected ? " row--selected" : ""}${drm ? " row--disabled" : ""}`}
+      onClick={drm ? undefined : onPick}
+      disabled={!!drm}
+      title={drm ? "Encrypted by DRM — segments cannot be saved." : undefined}
     >
       <span className="row__main">
         {label}
+        {fps ? `@${fps}` : ""}
         {mbps}
         {codec}
       </span>
-      {recommended ? <span className="row__pill">recommended</span> : null}
+      {hdr ? <span className="row__pill row__pill--hdr">{hdr}</span> : null}
+      {drm ? <span className="row__pill row__pill--drm">DRM · {drm}</span> : null}
+      {!drm && recommended ? <span className="row__pill">recommended</span> : null}
     </button>
   );
 }
