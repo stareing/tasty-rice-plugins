@@ -1,4 +1,4 @@
-export type StreamKind = "hls" | "dash" | "mp4" | "audio" | "image" | "other";
+export type StreamKind = "hls" | "dash" | "mp4" | "audio" | "image" | "text" | "other";
 
 export interface DetectedStream {
   /** Stable id derived from URL — used for dedupe + UI keys. */
@@ -24,7 +24,55 @@ export interface DetectedStream {
    * sniffing; the popup updates the row when the result arrives.
    */
   thumbDataUrl?: string;
+  /**
+   * Set when the page-side crawler detected EME / requestMediaKeySystemAccess
+   * around the time this stream was sniffed. The probe pipeline still has the
+   * authoritative answer (via `ProbeResult.drm`), but surfacing it on the
+   * row lets the user skip the probe round-trip on obviously-encrypted streams.
+   */
+  drmDetected?: boolean;
+  /**
+   * Set when the page is feeding the player through MSE (SourceBuffer.appendBuffer).
+   * Useful as a "this is the real underlying source" signal when the visible
+   * `<video>.src` is just `blob:`.
+   */
+  mseDetected?: boolean;
+  /**
+   * Origin of the sniff. `web-request` is the SW's webRequest sniffer, which
+   * sees every media URL the tab issues but knows nothing about the DOM
+   * element triggering it. `page-crawler` is the MAIN-world hook in
+   * injected.ts — it only fires for fetch/XHR the page itself initiated, so
+   * it's a stronger signal that the URL belongs to the page's player.
+   */
+  source?: "web-request" | "page-crawler";
+  /**
+   * 0..100 confidence that this row is the stream the user intended to grab.
+   * Computed by `scoreStream()` against the right-click focus context (which
+   * frame was clicked, when, and on what element). Used by the popup to sort
+   * the list and badge the top candidate — never gates capture or download.
+   */
+  score?: number;
   detectedAt: number;
+}
+
+/**
+ * Snapshot of the user's last right-click on `tabId`. Captured by the SW
+ * context-menu handler and used by `scoreStream()` to weight sniffed
+ * candidates against the page element the user actually pointed at.
+ *
+ * Lives in `chrome.storage.session` alongside `streamsByTab`. Cleared when
+ * the tab navigates or closes — same lifecycle as the streams list, so a
+ * stale focus from a previous page can't bias scores after a new sniff.
+ */
+export interface FocusContext {
+  tabId: number;
+  frameId?: number;
+  /** UNIX ms of the right-click. */
+  clickedAt: number;
+  /** `info.srcUrl` / `info.linkUrl` when present (skipped for blob:/data:). */
+  srcUrl?: string;
+  /** Which menu item the user picked — "page" covers the bare arm path. */
+  mediaTag: "video" | "audio" | "image" | "link" | "page";
 }
 
 export type DownloadPhase =
@@ -129,6 +177,14 @@ export interface PersistedJob {
   selection: DownloadSelection;
   /** ISO-ish timestamp; used to GC stale jobs. */
   startedAt: number;
+  /**
+   * Tab that originated the job — used as the proxy-fetch target so the
+   * offscreen document can ask that tab's page context to refetch on its
+   * behalf when a CDN rejects the direct fetch (page-runtime auth). Absent
+   * when the job came from a path that never had a tab (e.g. resumed
+   * after a crash; the proxy-fetch fallback then no-ops).
+   */
+  tabId?: number;
 }
 
 /* ---- Message envelope between popup ⇄ background ⇄ offscreen ---- */
@@ -157,6 +213,17 @@ export type RuntimeMessage = Targeted &
         contentType?: string;
         pageUrl?: string;
       }
+    /**
+     * Page-side DRM / MSE detection. Emitted by the MAIN-world crawler when
+     * `requestMediaKeySystemAccess` resolves or `MediaSource.addSourceBuffer`
+     * fires — surfaces the flag to every stream already detected on this tab
+     * (and every future stream until the tab navigates).
+     */
+    | {
+        type: "streams:report-flag";
+        flag: "drm" | "mse";
+        pageUrl?: string;
+      }
     | { type: "capture:arm"; tabId: number }
     | { type: "capture:status"; tabId: number; armedUntil: number }
     /**
@@ -182,4 +249,90 @@ export type RuntimeMessage = Targeted &
     | { type: "thumb:request"; streamId: string; stream: DetectedStream }
     | { type: "thumb:result"; streamId: string; dataUrl?: string; error?: string }
     | { type: "offscreen:ready" }
+    /**
+     * Offscreen → SW: ask the page hosting `jobId`'s tab to refetch `url`
+     * with the page's own auth state. SW forwards to the content-script
+     * bridge via `chrome.tabs.sendMessage` and replies through `sendResponse`.
+     */
+    | {
+        type: "proxy:fetch";
+        jobId: string;
+        url: string;
+        method?: string;
+        headers?: Record<string, string>;
+      }
+    /**
+     * Page-side MSE capture stream. The MAIN-world hook posts every
+     * `SourceBuffer.appendBuffer` chunk through the bridge → SW → offscreen
+     * pipeline; offscreen writes the chunks straight to OPFS so a fully-
+     * encrypted-network fMP4 can still be saved when the page already
+     * decrypted it for the player.
+     */
+    | {
+        type: "mse:chunk";
+        sessionId: string;
+        mimeType?: string;
+        bytes: Uint8Array;
+        isInit: boolean;
+        ordinal: number;
+      }
+    /** SW → offscreen: stop the in-progress MSE write session and remux. */
+    | {
+        type: "mse:finish";
+        sessionId: string;
+        suggestedName: string;
+        saveAs?: boolean;
+      }
+    /**
+     * Persisted-job storage shape (chrome.storage.local) used by the
+     * standalone manager page. Pure data — no bridging behaviour beyond
+     * what `download:progress` already provides.
+     */
+    | { type: "jobs:list" }
+    | { type: "jobs:list:result"; jobs: ManagedJobRecord[] }
+    | { type: "jobs:remove"; jobId: string }
+    /**
+     * MSE capture: opt-in mode where the page-side hook clones every
+     * SourceBuffer.appendBuffer payload. The SW arms the page hook,
+     * accumulates chunk metadata for the popup, and finalises the file
+     * when the user clicks "Save".
+     */
+    | { type: "mse:arm"; tabId: number; enable: boolean }
+    | {
+        type: "mse:status";
+        tabId: number;
+        active: boolean;
+        sessions: { sessionId: string; mimeType?: string; bytes: number; chunks: number }[];
+      }
+    | { type: "mse:status:query"; tabId: number }
+    | { type: "mse:save"; sessionId: string; suggestedName: string }
   );
+
+/* ----------------------- managed-job persistence ----------------------- */
+
+/**
+ * Long-lived record of every job the user starts, surfaced by the
+ * standalone downloads manager page. Distinct from `PersistedJob`, which
+ * lives in `chrome.storage.session` and is deleted as soon as the job
+ * resolves — `ManagedJobRecord` survives the resolution and stores the
+ * outcome (saved filename, error message) for the user to inspect later.
+ */
+export interface ManagedJobRecord {
+  jobId: string;
+  /** Source stream snapshot — enough to retry without re-sniffing. */
+  stream: DetectedStream;
+  selection: DownloadSelection;
+  /** UNIX ms; useful for sorting in the manager UI. */
+  startedAt: number;
+  finishedAt?: number;
+  /** Last seen progress phase. Manager UI mirrors what the popup shows. */
+  phase: DownloadPhase;
+  ratio: number;
+  segmentsDone?: number;
+  segmentsTotal?: number;
+  retries?: number;
+  message?: string;
+  error?: string;
+  /** Filled in from the SW when chrome.downloads accepts the file. */
+  savedFilename?: string;
+}

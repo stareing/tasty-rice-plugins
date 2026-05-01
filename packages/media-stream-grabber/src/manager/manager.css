@@ -1,0 +1,78 @@
+/* The manager page is a dedicated tab, not a 380px popup — relax the
+ * popup's body width and switch to a wider layout. */
+.manager-body {
+  width: 100%;
+  min-height: 100vh;
+  max-height: none;
+  overflow: auto;
+}
+
+.manager-body .app {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.manager-body .stream {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px 16px;
+  align-items: center;
+}
+
+.manager__toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.manager__title {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.manager__empty {
+  padding: 64px 16px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.manager__row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 12px;
+  align-items: center;
+  border: 1px solid var(--border);
+  background: var(--card);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.manager__name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.manager__sub {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.manager__phase {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: var(--border);
+  color: var(--fg);
+}
+.manager__phase--done { background: var(--ok); color: white; }
+.manager__phase--error { background: var(--danger); color: white; }
+.manager__phase--running { background: var(--accent); color: white; }

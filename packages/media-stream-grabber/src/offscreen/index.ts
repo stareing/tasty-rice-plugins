@@ -1,11 +1,11 @@
 /**
  * Offscreen worker — runs in a regular DOM page, so it can use fetch(),
- * SharedArrayBuffer (when COOP/COEP allow), Web Workers, IndexedDB and
+ * SharedArrayBuffer (when COOP/COEP allow), Web Workers, OPFS and
  * ffmpeg.wasm.
  *
  * Listens for `download:probe` (returns variants/audio tracks) and
  * `download:start` (runs the HLS/DASH pipeline, with segment-level retries
- * and IDB-backed resume). Routes only messages whose `target` is
+ * and OPFS-backed resume). Routes only messages whose `target` is
  * "offscreen", per CLAUDE.md cross-context conventions.
  */
 
@@ -33,6 +33,14 @@ import {
   type DashRepresentation,
   type DashSegmentRef,
 } from "@/lib/mpd";
+import { FFFSType } from "@ffmpeg/ffmpeg";
+import {
+  openSegmentStore,
+  sweepOrphanedJobDirs,
+  type Channel,
+  type SegmentStore,
+} from "./segmentStorage";
+import { TailLossTracker } from "./tailLoss";
 
 const cancelled = new Set<string>();
 const SEGMENT_RETRIES = 3;
@@ -46,12 +54,16 @@ const SEGMENT_CONCURRENCY = 4;
 // previously able to hang the whole job indefinitely; the AbortController
 // below converts that into a normal retry path.
 const SEGMENT_FETCH_TIMEOUT_MS = 30_000;
-const IDB_NAME = "msg.segments";
-const IDB_STORE = "buffers";
 const DASH_KEY_PREFIX = "dash::";
 const DASH_AUDIO_PREFIX = "dash-audio::";
 const DASH_TEXT_PREFIX = "dash-text::";
 const HLS_CHILD_PLAYLIST_RE = /(_(?:\d+w|audio|video|v\d+|a\d+)|-(?:video|audio|av)\d*)\.m3u8(\?|$|#)/i;
+// WORKERFS mount point inside the ffmpeg.wasm worker — the per-channel
+// merged OPFS files are exposed to ffmpeg under this directory so the
+// muxer reads them lazily without copying through MEMFS first.
+const FF_INPUT_MOUNT = "/in";
+const FF_VIDEO_INPUT = `${FF_INPUT_MOUNT}/video.bin`;
+const FF_AUDIO_INPUT = `${FF_INPUT_MOUNT}/audio.bin`;
 
 chrome.runtime.onMessage.addListener((msg: RuntimeMessage, _sender, sendResponse) => {
   if (msg.target !== "offscreen") return false;
@@ -91,6 +103,25 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, _sender, sendResponse
       .catch((err) =>
         sendThumbResult(msg.streamId, undefined, errorMessage(err)),
       );
+    sendResponse({ ok: true });
+    return true;
+  }
+  if (msg.type === "mse:chunk") {
+    void appendMseChunk(msg.sessionId, msg.bytes, msg.ordinal, msg.mimeType, msg.isInit).catch(
+      (err) => {
+        // Chunks are best-effort: the page is still feeding the live
+        // player, so a failed write here just means the saved file will
+        // be incomplete. Log via the same channel as ffmpeg errors.
+        void err;
+      },
+    );
+    sendResponse({ ok: true });
+    return true;
+  }
+  if (msg.type === "mse:finish") {
+    void finaliseMseSession(msg.sessionId, msg.suggestedName).catch(() => {
+      /* surfaces via download:progress error already */
+    });
     sendResponse({ ok: true });
     return true;
   }
@@ -163,18 +194,104 @@ async function fetchWithBudget(
   }
 }
 
+/**
+ * Job-id is threaded through fetch calls so the proxy-fetch fallback can
+ * reach the right tab. Set by `runDownload` / `runDownloadHls` etc. for
+ * the duration of one job; null for one-shot calls (probes, thumbnail
+ * extraction) where there's no committed origin tab to proxy through.
+ */
+let activeJobId: string | undefined;
+
+function setActiveJobId(id: string | undefined): void {
+  activeJobId = id;
+}
+
 async function fetchBytes(
   url: string,
   headers?: Record<string, string>,
+  timeoutMs: number = SEGMENT_FETCH_TIMEOUT_MS,
 ): Promise<Uint8Array> {
-  const res = await fetchWithBudget(
-    url,
-    { headers, credentials: "include" },
-    SEGMENT_FETCH_TIMEOUT_MS,
-  );
-  if (!res.ok) throw new HttpStatusError(res.status, url);
-  const buf = await res.arrayBuffer();
-  return new Uint8Array(buf);
+  try {
+    const res = await fetchWithBudget(
+      url,
+      { headers, credentials: "include" },
+      timeoutMs,
+    );
+    if (!res.ok) {
+      // 401/403 from the CDN almost always means the offscreen request
+      // doesn't carry the page-runtime auth (signed-cookie token, custom
+      // header, etc.). Page-proxy fetch reissues the request from the
+      // page itself so the CDN sees the same identity it normally does.
+      if ((res.status === 401 || res.status === 403) && activeJobId) {
+        const proxied = await proxyFetchBytes(activeJobId, url, headers).catch(
+          () => undefined,
+        );
+        if (proxied) return proxied;
+      }
+      throw new HttpStatusError(res.status, url);
+    }
+    const buf = await res.arrayBuffer();
+    return new Uint8Array(buf);
+  } catch (err) {
+    // Network-level failure (TypeError "Failed to fetch", CORS rejection
+    // before status). Try the proxy fetch once before surfacing the error.
+    if (activeJobId && (err instanceof TypeError || (err as Error).message?.includes("Failed to fetch"))) {
+      const proxied = await proxyFetchBytes(activeJobId, url, headers).catch(
+        () => undefined,
+      );
+      if (proxied) return proxied;
+    }
+    throw err;
+  }
+}
+
+/**
+ * Ask the SW to refetch `url` from the page that started this job.
+ * Returns the bytes on success; throws on failure so the caller sees the
+ * proxy attempt as a clean "couldn't recover" signal.
+ */
+async function proxyFetchBytes(
+  jobId: string,
+  url: string,
+  headers?: Record<string, string>,
+): Promise<Uint8Array> {
+  const reply = await new Promise<{
+    ok: boolean;
+    status: number;
+    bytes?: Uint8Array | { [k: number]: number; length?: number };
+    error?: string;
+  }>((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      {
+        type: "proxy:fetch",
+        jobId,
+        url,
+        method: "GET",
+        headers: headers ?? {},
+        target: "sw",
+      } satisfies RuntimeMessage,
+      (resp: any) => {
+        const lastErr = chrome.runtime.lastError;
+        if (lastErr) {
+          reject(new Error(lastErr.message || "proxy-fetch-no-sw"));
+          return;
+        }
+        resolve(resp ?? { ok: false, status: 0, error: "no-response" });
+      },
+    );
+  });
+  if (!reply.ok || !reply.bytes) {
+    throw new HttpStatusError(reply.status || 0, url);
+  }
+  // The bytes traverse two structured-clone hops (page → SW → offscreen).
+  // Either side can leave them as a plain object with numeric keys —
+  // normalise to Uint8Array so callers don't have to defend against shape.
+  if (reply.bytes instanceof Uint8Array) return reply.bytes;
+  const arr = reply.bytes as { [k: number]: number; length?: number };
+  const length = typeof arr.length === "number" ? arr.length : Object.keys(arr).length;
+  const out = new Uint8Array(length);
+  for (let i = 0; i < length; i++) out[i] = arr[i] ?? 0;
+  return out;
 }
 
 async function fetchText(url: string): Promise<string> {
@@ -225,69 +342,27 @@ function ivForSequence(explicit: Uint8Array | undefined, sequence: number): Uint
   return iv;
 }
 
-/* ---------------------------- IDB segment cache ----------------------- */
+/* ---------------------------- segment cache ----------------------- */
 //
-// Persist downloaded segments by (jobId, channel, index) so SW restart
-// doesn't waste the user's bandwidth. Cleared on job completion or cancel.
+// Persisted segment storage now lives in segmentStorage.ts (OPFS-backed).
+// This module just owns the orphan-dir GC at startup so a previous
+// crash/cancel doesn't leak job directories indefinitely.
 
-let idbPromise: Promise<IDBDatabase> | null = null;
+void runOrphanedSweep();
 
-function openIdb(): Promise<IDBDatabase> {
-  if (idbPromise) return idbPromise;
-  idbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(IDB_NAME, 1);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      if (!db.objectStoreNames.contains(IDB_STORE)) {
-        db.createObjectStore(IDB_STORE);
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-  return idbPromise;
+async function runOrphanedSweep(): Promise<void> {
+  // Active jobs are tracked in the SW (`jobsById`); the offscreen doesn't
+  // see them directly. Conservatively wait until any in-flight start/probe
+  // has registered its jobId in `cancelled`-or-active state, then sweep
+  // anything else. In practice this runs once per offscreen wake.
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+  await sweepOrphanedJobDirs((jobId) => isJobInFlight(jobId));
 }
 
-function idbKey(jobId: string, channel: "v" | "a", index: number): string {
-  return `${jobId}::${channel}::${index}`;
-}
+const inFlightJobs = new Set<string>();
 
-async function idbGet(key: string): Promise<Uint8Array | undefined> {
-  const db = await openIdb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(IDB_STORE, "readonly");
-    const req = tx.objectStore(IDB_STORE).get(key);
-    req.onsuccess = () => resolve(req.result as Uint8Array | undefined);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function idbSet(key: string, value: Uint8Array): Promise<void> {
-  const db = await openIdb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(IDB_STORE, "readwrite");
-    tx.objectStore(IDB_STORE).put(value, key);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-async function idbClearJob(jobId: string): Promise<void> {
-  const db = await openIdb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(IDB_STORE, "readwrite");
-    const store = tx.objectStore(IDB_STORE);
-    const req = store.openCursor();
-    req.onsuccess = () => {
-      const cursor = req.result;
-      if (!cursor) return;
-      const key = String(cursor.key);
-      if (key.startsWith(`${jobId}::`)) cursor.delete();
-      cursor.continue();
-    };
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
+function isJobInFlight(jobId: string): boolean {
+  return inFlightJobs.has(jobId);
 }
 
 /* ------------------------------ probe ------------------------------- */
@@ -511,15 +586,20 @@ async function runDownload(
   jobId: string,
   selection: DownloadSelection,
 ): Promise<void> {
-  if (stream.kind === "hls") {
-    await runDownloadHls(stream, jobId, selection);
-    return;
+  setActiveJobId(jobId);
+  try {
+    if (stream.kind === "hls") {
+      await runDownloadHls(stream, jobId, selection);
+      return;
+    }
+    if (stream.kind === "dash") {
+      await runDownloadDash(stream, jobId, selection);
+      return;
+    }
+    throw new Error(`Offscreen pipeline does not handle kind=${stream.kind}.`);
+  } finally {
+    setActiveJobId(undefined);
   }
-  if (stream.kind === "dash") {
-    await runDownloadDash(stream, jobId, selection);
-    return;
-  }
-  throw new Error(`Offscreen pipeline does not handle kind=${stream.kind}.`);
 }
 
 /* ------------------------------ HLS pipeline -------------------------- */
@@ -837,34 +917,73 @@ async function finishDownload(
   audioInit: Uint8Array | undefined,
   keyCache: Map<string, Uint8Array>,
 ): Promise<void> {
-  const videoBytes = await downloadChannel(
-    { channel: "v", segments: videoSegments, initBytes: videoInit },
-    jobId,
-    keyCache,
-    "downloading-segments",
-  );
-
-  let audioBytes: Uint8Array | undefined;
-  if (audioSegments && audioSegments.length) {
-    audioBytes = await downloadChannel(
-      { channel: "a", segments: audioSegments, initBytes: audioInit },
+  inFlightJobs.add(jobId);
+  const store = await openSegmentStore(jobId);
+  try {
+    await downloadChannel(
+      { channel: "v", segments: videoSegments, initBytes: videoInit },
       jobId,
+      store,
       keyCache,
-      "downloading-audio",
+      "downloading-segments",
     );
+    if (audioSegments && audioSegments.length) {
+      await downloadChannel(
+        { channel: "a", segments: audioSegments, initBytes: audioInit },
+        jobId,
+        store,
+        keyCache,
+        "downloading-audio",
+      );
+    }
+
+    reportProgress({ jobId, phase: "merging", ratio: 0.92, message: "Consolidating…" });
+    await consolidateChannel(store, "v", videoInit, videoSegments.length);
+    if (audioSegments && audioSegments.length) {
+      await consolidateChannel(store, "a", audioInit, audioSegments.length);
+    }
+
+    reportProgress({ jobId, phase: "merging", ratio: 0.95, message: "Remuxing to MP4…" });
+    const output = await remuxFromStore(store, Boolean(audioSegments?.length), jobId);
+
+    reportProgress({ jobId, phase: "saving", ratio: 0.99 });
+    await saveBlob(
+      new Blob([toArrayBuffer(output.bytes)], { type: output.mimeType }),
+      withExtension(stream.suggestedName, output.extension),
+    );
+
+    reportProgress({ jobId, phase: "done", ratio: 1 });
+  } finally {
+    inFlightJobs.delete(jobId);
+    await store.destroy().catch(() => {
+      /* OPFS cleanup is best-effort; orphan sweep on next wake reclaims */
+    });
   }
+}
 
-  reportProgress({ jobId, phase: "merging", ratio: 0.95, message: "Remuxing to MP4…" });
-  const output = await remuxToPlayable(videoBytes, audioBytes, jobId);
-
-  reportProgress({ jobId, phase: "saving", ratio: 0.99 });
-  await saveBlob(
-    new Blob([toArrayBuffer(output.bytes)], { type: output.mimeType }),
-    withExtension(stream.suggestedName, output.extension),
-  );
-
-  reportProgress({ jobId, phase: "done", ratio: 1 });
-  await idbClearJob(jobId);
+/**
+ * Stream every per-segment OPFS file into one merged file the muxer can
+ * mount. We could mount each segment via WORKERFS individually, but argv
+ * length and the concat-demuxer's unfriendliness with init-less fMP4
+ * fragments both push us toward "one big file the demuxer parses as
+ * one continuous bitstream" — same shape ffmpeg saw before, sourced from
+ * disk instead of from a 2 GB ArrayBuffer in JS heap.
+ */
+async function consolidateChannel(
+  store: SegmentStore,
+  channel: Channel,
+  initBytes: Uint8Array | undefined,
+  segmentCount: number,
+): Promise<void> {
+  await store.beginMerged(channel);
+  try {
+    if (initBytes) await store.appendMerged(channel, initBytes);
+    for (let i = 0; i < segmentCount; i++) {
+      await store.appendSegmentToMerged(channel, i);
+    }
+  } finally {
+    await store.endMerged(channel);
+  }
 }
 
 async function fetchInitSegment(init: {
@@ -881,41 +1000,36 @@ async function fetchInitSegment(init: {
 async function downloadChannel(
   job: SegmentJob,
   jobId: string,
+  store: SegmentStore,
   keyCache: Map<string, Uint8Array>,
   phaseName: "downloading-segments" | "downloading-audio",
-): Promise<Uint8Array> {
-  const { segments, initBytes } = job;
-  const buffers = new Array<Uint8Array | null>(segments.length).fill(null);
+): Promise<void> {
+  const { segments, channel } = job;
+  const completed = new Array<boolean>(segments.length).fill(false);
   let done = 0;
   let cursor = 0;
   let totalRetries = 0;
+  const tracker = new TailLossTracker();
 
-  // Hydrate from IDB to skip already-downloaded segments.
+  // Hydrate from OPFS — single metadata check per segment, no full read.
+  // Segments already on disk count as done; the merge step picks them up
+  // by index when consolidating into the per-channel merged file.
   for (let i = 0; i < segments.length; i++) {
-    const cached = await idbGet(idbKey(jobId, job.channel, i));
-    if (cached) {
-      buffers[i] = cached;
+    if (await store.has(channel, i)) {
+      completed[i] = true;
       done++;
     }
   }
-  if (done) {
-    reportProgress({
-      jobId,
-      phase: phaseName,
-      ratio: done / segments.length,
-      segmentsDone: done,
-      segmentsTotal: segments.length,
-      message: `Resumed ${done}/${segments.length} from cache.`,
-    });
-  } else {
-    reportProgress({
-      jobId,
-      phase: phaseName,
-      ratio: 0,
-      segmentsDone: 0,
-      segmentsTotal: segments.length,
-    });
-  }
+  reportProgress({
+    jobId,
+    phase: phaseName,
+    ratio: segments.length === 0 ? 1 : done / segments.length,
+    segmentsDone: done,
+    segmentsTotal: segments.length,
+    message: done ? `Resumed ${done}/${segments.length} from cache.` : undefined,
+  });
+
+  if (done === segments.length) return;
 
   await new Promise<void>((resolve, reject) => {
     let active = 0;
@@ -928,20 +1042,20 @@ async function downloadChannel(
         reject(new Error("Cancelled."));
         return;
       }
-      while (cursor < segments.length && buffers[cursor] !== null) cursor++;
+      while (cursor < segments.length && completed[cursor]) cursor++;
 
       while (active < SEGMENT_CONCURRENCY && cursor < segments.length) {
         const idx = cursor++;
-        if (buffers[idx] !== null) continue;
+        if (completed[idx]) continue;
         active++;
-        void downloadSegmentWithRetry(segments[idx], idx, keyCache)
+        const startedAt = performance.now();
+        void downloadSegmentWithRetry(segments[idx], idx, keyCache, tracker)
           .then(async ({ bytes, retries }) => {
-            buffers[idx] = bytes;
+            await store.write(channel, idx, bytes);
+            tracker.observe(performance.now() - startedAt);
+            completed[idx] = true;
             totalRetries += retries;
             done++;
-            await idbSet(idbKey(jobId, job.channel, idx), bytes).catch(() => {
-              /* IDB best effort */
-            });
             reportProgress({
               jobId,
               phase: phaseName,
@@ -965,33 +1079,22 @@ async function downloadChannel(
     };
     launchNext();
   });
-
-  // Concatenate: init segment first (if fMP4), then media segments in order.
-  const initLen = initBytes?.byteLength ?? 0;
-  const totalLen = buffers.reduce((acc, b) => acc + (b?.byteLength ?? 0), initLen);
-  const concatenated = new Uint8Array(totalLen);
-  let off = 0;
-  if (initBytes) {
-    concatenated.set(initBytes, 0);
-    off = initBytes.byteLength;
-  }
-  for (const b of buffers) {
-    if (!b) continue;
-    concatenated.set(b, off);
-    off += b.byteLength;
-  }
-  return concatenated;
 }
 
 async function downloadSegmentWithRetry(
   seg: HlsSegment,
   index: number,
   keyCache: Map<string, Uint8Array>,
+  tracker: TailLossTracker,
 ): Promise<{ bytes: Uint8Array; retries: number }> {
   let lastErr: unknown;
   for (let attempt = 0; attempt <= SEGMENT_RETRIES; attempt++) {
     try {
-      const bytes = await downloadSegment(seg, index, keyCache);
+      const adaptive = tracker.budgetMs();
+      const budget = adaptive != null
+        ? Math.min(adaptive, SEGMENT_FETCH_TIMEOUT_MS)
+        : SEGMENT_FETCH_TIMEOUT_MS;
+      const bytes = await downloadSegment(seg, index, keyCache, budget);
       return { bytes, retries: attempt };
     } catch (err) {
       lastErr = err;
@@ -1010,12 +1113,13 @@ async function downloadSegment(
   seg: HlsSegment,
   index: number,
   keyCache: Map<string, Uint8Array>,
+  timeoutMs: number,
 ): Promise<Uint8Array> {
   const headers: Record<string, string> = {};
   if (seg.byteRange) {
     headers.Range = `bytes=${seg.byteRange.offset}-${seg.byteRange.offset + seg.byteRange.length - 1}`;
   }
-  let bytes = await fetchBytes(seg.uri, headers);
+  let bytes = await fetchBytes(seg.uri, headers, timeoutMs);
   if (seg.key) {
     const keyBytes = keyCache.get(seg.key.uri);
     if (!keyBytes) throw new Error(`Missing key for segment ${index}.`);
@@ -1070,6 +1174,14 @@ interface RemuxOutput {
 
 type StreamFormat = "fmp4" | "mpegts" | "aac" | "mp3" | "unknown";
 
+/** Read the leading bytes of an OPFS-backed file without materialising
+ *  the whole 2 GB blob in JS heap — only the first 256 bytes are needed
+ *  for the magic-bytes sniff. */
+async function detectFormatFromFile(file: File): Promise<StreamFormat> {
+  const head = await file.slice(0, 256).arrayBuffer();
+  return detectFormat(new Uint8Array(head));
+}
+
 /** Sniff container/codec from leading bytes — way more reliable than the
  *  URL extension on CDNs that hand out everything as `.ts`. */
 function detectFormat(bytes: Uint8Array): StreamFormat {
@@ -1103,27 +1215,36 @@ function extensionFor(format: StreamFormat): string {
   }
 }
 
-async function remuxToPlayable(
-  videoBytes: Uint8Array,
-  audioBytes: Uint8Array | undefined,
+async function remuxFromStore(
+  store: SegmentStore,
+  hasAudio: boolean,
   jobId: string,
 ): Promise<RemuxOutput> {
   const ff = await getFfmpeg();
 
-  const videoFmt = detectFormat(videoBytes);
-  const videoIn = `video.${extensionFor(videoFmt)}`;
-  // writeFile transfers the underlying ArrayBuffer to the worker, so the
-  // caller's view is detached after this returns. We've finished with it
-  // either way — the source-of-truth is now in MEMFS.
-  await ff.writeFile(videoIn, videoBytes);
+  const videoFile = await store.getMergedFile("v");
+  if (!videoFile) throw new Error("Consolidated video file is empty.");
+  const videoFmt = await detectFormatFromFile(videoFile);
 
-  let audioIn: string | undefined;
+  let audioFile: File | undefined;
   let audioFmt: StreamFormat = "unknown";
-  if (audioBytes) {
-    audioFmt = detectFormat(audioBytes);
-    audioIn = `audio.${extensionFor(audioFmt)}`;
-    await ff.writeFile(audioIn, audioBytes);
+  if (hasAudio) {
+    audioFile = await store.getMergedFile("a");
+    if (audioFile) audioFmt = await detectFormatFromFile(audioFile);
   }
+
+  // WORKERFS exposes the OPFS-backed merged file(s) to the ffmpeg worker by
+  // name; the muxer reads them lazily, so MEMFS never has to hold the
+  // 2 GB input the previous pipeline needed. We unmount no matter how the
+  // run ends so a retry doesn't see a stale mount layered on the previous
+  // attempt's files.
+  await ensureFfInputDir(ff);
+  await ff.mount(FFFSType.WORKERFS, {
+    blobs: [
+      { name: "video.bin", data: videoFile },
+      ...(audioFile ? [{ name: "audio.bin", data: audioFile }] : []),
+    ],
+  }, FF_INPUT_MOUNT);
 
   // ADTS audio inside an MP4 container needs the aac_adtstoasc bitstream
   // filter; fMP4 audio is already AudioSpecificConfig and rejects the
@@ -1134,12 +1255,12 @@ async function remuxToPlayable(
     ? ["-c:a", "copy", "-bsf:a", "aac_adtstoasc"]
     : ["-c:a", "copy"];
 
-  const attempts: { args: string[]; reason: string }[] = audioIn
+  const attempts: { args: string[]; reason: string }[] = audioFile
     ? [
         {
           reason: "copy-both",
           args: [
-            "-i", videoIn, "-i", audioIn,
+            "-i", FF_VIDEO_INPUT, "-i", FF_AUDIO_INPUT,
             "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "copy", ...audioCopyArgs,
             "-movflags", "+faststart",
@@ -1151,7 +1272,7 @@ async function remuxToPlayable(
           // as raw audio with -c copy fails. Re-encode audio as a last resort.
           reason: "copy-video-transcode-audio",
           args: [
-            "-i", videoIn, "-i", audioIn,
+            "-i", FF_VIDEO_INPUT, "-i", FF_AUDIO_INPUT,
             "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", "192k",
@@ -1164,43 +1285,66 @@ async function remuxToPlayable(
         {
           reason: "copy-video-only",
           args: [
-            "-i", videoIn,
+            "-i", FF_VIDEO_INPUT,
             "-c", "copy",
             "-movflags", "+faststart",
           ],
         },
       ];
+  // Silence unused-var warnings on videoFmt while keeping the sniff for
+  // future log/diagnostic surface — the format is announced in ffmpeg's log
+  // tail anyway, but we still want the sniff for telemetry parity.
+  void videoFmt;
 
   let lastErr: unknown;
-  for (let i = 0; i < attempts.length; i++) {
-    const output = `output-${i}.mp4`;
-    ffmpegLogTail.length = 0;
-    try {
-      const code = await ff.exec([...attempts[i].args, output]);
-      if (code !== 0) {
-        throw new Error(`ffmpeg exited with code ${code} (${attempts[i].reason})`);
+  try {
+    for (let i = 0; i < attempts.length; i++) {
+      const output = `output-${i}.mp4`;
+      ffmpegLogTail.length = 0;
+      try {
+        const code = await ff.exec([...attempts[i].args, output]);
+        if (code !== 0) {
+          throw new Error(`ffmpeg exited with code ${code} (${attempts[i].reason})`);
+        }
+        const out = await ff.readFile(output);
+        if (typeof out === "string") {
+          throw new Error("ffmpeg returned text, expected binary.");
+        }
+        const bytes = out as Uint8Array;
+        if (bytes.byteLength < 1024) {
+          throw new Error(`ffmpeg produced ${bytes.byteLength}-byte output (${attempts[i].reason})`);
+        }
+        await ff.deleteFile(output).catch(() => {});
+        return { bytes, mimeType: "video/mp4", extension: ".mp4" };
+      } catch (err) {
+        lastErr = err;
+        reportProgress({
+          jobId,
+          phase: "merging",
+          ratio: 0.96,
+          message: `Mux attempt "${attempts[i].reason}" failed; ${i + 1 < attempts.length ? "trying fallback" : "no more fallbacks"}.`,
+        });
       }
-      const out = await ff.readFile(output);
-      if (typeof out === "string") {
-        throw new Error("ffmpeg returned text, expected binary.");
-      }
-      const bytes = out as Uint8Array;
-      if (bytes.byteLength < 1024) {
-        throw new Error(`ffmpeg produced ${bytes.byteLength}-byte output (${attempts[i].reason})`);
-      }
-      return { bytes, mimeType: "video/mp4", extension: ".mp4" };
-    } catch (err) {
-      lastErr = err;
-      reportProgress({
-        jobId,
-        phase: "merging",
-        ratio: 0.96,
-        message: `Mux attempt "${attempts[i].reason}" failed; ${i + 1 < attempts.length ? "trying fallback" : "no more fallbacks"}.`,
-      });
     }
+  } finally {
+    await ff.unmount(FF_INPUT_MOUNT).catch(() => {});
   }
 
   throw new Error(`Mux failed: ${formatFfmpegError(lastErr)}`);
+}
+
+let ffInputDirReady = false;
+
+async function ensureFfInputDir(
+  ff: import("@ffmpeg/ffmpeg").FFmpeg,
+): Promise<void> {
+  if (ffInputDirReady) return;
+  // createDir throws if the dir already exists from a prior session — we
+  // don't bother distinguishing, the only path that needs the dir is mount
+  // and that creates intermediate directories on demand on most ffmpeg
+  // builds. Best-effort.
+  await ff.createDir(FF_INPUT_MOUNT).catch(() => {});
+  ffInputDirReady = true;
 }
 
 function formatFfmpegError(err: unknown): string {
@@ -1361,16 +1505,26 @@ async function extractThumbJpeg(bytes: Uint8Array, format: StreamFormat): Promis
   // session doesn't accumulate megabytes of stale thumbnails.
   await ff.deleteFile(inputName).catch(() => {});
   await ff.deleteFile(outputName).catch(() => {});
-  return `data:image/jpeg;base64,${bytesToBase64(jpeg)}`;
+  return await bytesToDataUrl(jpeg, "image/jpeg");
 }
 
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.byteLength; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary);
+/**
+ * Bytes → `data:` URL via the browser's native FileReader path. Avoids the
+ * `String.fromCharCode(...subarray)` argument-spread that previously blew
+ * the stack on JPEGs the size of a stack frame, and avoids the GC pressure
+ * of accumulating megabytes of intermediate strings.
+ */
+function bytesToDataUrl(bytes: Uint8Array, mimeType: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result;
+      if (typeof result === "string") resolve(result);
+      else reject(new Error("FileReader produced non-string result."));
+    };
+    reader.onerror = () => reject(reader.error ?? new Error("FileReader failed."));
+    reader.readAsDataURL(new Blob([toArrayBuffer(bytes)], { type: mimeType }));
+  });
 }
 
 function errorMessage(err: unknown): string {
@@ -1534,6 +1688,162 @@ function addOffset(timestamp: string, offsetSec: number): string {
 }
 function pad2(n: number): string { return String(n).padStart(2, "0"); }
 function pad3(n: number): string { return String(n).padStart(3, "0"); }
+
+/* --------------------------- MSE capture ----------------------------- */
+//
+// Page-side `SourceBuffer.appendBuffer` payloads land here as `mse:chunk`
+// messages. Each session corresponds to one SourceBuffer in the page (so
+// audio + video on a multi-track player are kept distinct). Chunks are
+// streamed to OPFS as a single growing per-session file so we don't burn
+// JS heap on the bytes — ffmpeg mounts the file via WORKERFS at finalise
+// time, just like the HLS / DASH pipeline.
+
+const MSE_DIR = "msg-mse";
+const mseWritables = new Map<string, FileSystemWritableFileStream>();
+const mseSessionMime = new Map<string, string | undefined>();
+
+async function getMseDir(): Promise<FileSystemDirectoryHandle | undefined> {
+  if (typeof navigator === "undefined" || !navigator.storage?.getDirectory) {
+    return undefined;
+  }
+  const root = await navigator.storage.getDirectory();
+  return await root.getDirectoryHandle(MSE_DIR, { create: true });
+}
+
+async function appendMseChunk(
+  sessionId: string,
+  bytes: Uint8Array | { [k: number]: number; length?: number },
+  _ordinal: number,
+  mimeType: string | undefined,
+  _isInit: boolean,
+): Promise<void> {
+  const dir = await getMseDir();
+  if (!dir) return;
+  let writable = mseWritables.get(sessionId);
+  if (!writable) {
+    const handle = await dir.getFileHandle(`${sessionId}.bin`, { create: true });
+    writable = await handle.createWritable({ keepExistingData: true });
+    mseWritables.set(sessionId, writable);
+    if (mimeType) mseSessionMime.set(sessionId, mimeType);
+  }
+  const view =
+    bytes instanceof Uint8Array
+      ? bytes
+      : (() => {
+          // Structured-clone may have flattened the Uint8Array into a
+          // plain object with numeric keys — defensive shape coercion.
+          const len = typeof bytes.length === "number" ? bytes.length : Object.keys(bytes).length;
+          const u = new Uint8Array(len);
+          for (let i = 0; i < len; i++) u[i] = bytes[i] ?? 0;
+          return u;
+        })();
+  // Wrap as Blob — same trick as segmentStorage.asWritableChunk: dodges
+  // the strict lib.dom rejection of `Uint8Array<ArrayBufferLike>`.
+  const copy = new ArrayBuffer(view.byteLength);
+  new Uint8Array(copy).set(view);
+  await writable.write(new Blob([copy]));
+}
+
+async function finaliseMseSession(
+  sessionId: string,
+  suggestedName: string,
+): Promise<void> {
+  const writable = mseWritables.get(sessionId);
+  if (writable) {
+    await writable.close().catch(() => {});
+    mseWritables.delete(sessionId);
+  }
+  const dir = await getMseDir();
+  if (!dir) {
+    reportProgress({
+      jobId: sessionId,
+      phase: "error",
+      ratio: 0,
+      error: "OPFS unavailable — MSE capture has nothing to save.",
+    });
+    return;
+  }
+  const fileHandle = await dir.getFileHandle(`${sessionId}.bin`).catch(() => undefined);
+  if (!fileHandle) {
+    reportProgress({
+      jobId: sessionId,
+      phase: "error",
+      ratio: 0,
+      error: "MSE session has no captured bytes.",
+    });
+    return;
+  }
+  const file = await fileHandle.getFile();
+  if (file.size === 0) {
+    reportProgress({
+      jobId: sessionId,
+      phase: "error",
+      ratio: 0,
+      error: "MSE session produced 0 bytes.",
+    });
+    return;
+  }
+
+  // Try to remux the captured bytes into a clean MP4 — most MSE buffers
+  // are fMP4 in practice. Fall back to raw `.bin` save when ffmpeg refuses
+  // the input (rare; some ABR players hand the SourceBuffer init segments
+  // out of order and the remux fails).
+  reportProgress({
+    jobId: sessionId,
+    phase: "merging",
+    ratio: 0.9,
+    message: `Remuxing MSE capture (${(file.size / 1024 / 1024).toFixed(1)} MB)…`,
+  });
+  try {
+    const ff = await getFfmpeg();
+    await ensureFfInputDir(ff);
+    await ff.mount(FFFSType.WORKERFS, {
+      blobs: [{ name: "mse.bin", data: file }],
+    }, FF_INPUT_MOUNT);
+    try {
+      const output = "mse-out.mp4";
+      ffmpegLogTail.length = 0;
+      const code = await ff.exec([
+        "-i", `${FF_INPUT_MOUNT}/mse.bin`,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        output,
+      ]);
+      if (code !== 0) throw new Error(`ffmpeg exit ${code}`);
+      const out = await ff.readFile(output);
+      if (typeof out === "string") throw new Error("ffmpeg returned text.");
+      const bytes = out as Uint8Array;
+      await ff.deleteFile(output).catch(() => {});
+      reportProgress({ jobId: sessionId, phase: "saving", ratio: 0.99 });
+      await saveBlob(
+        new Blob([toArrayBuffer(bytes)], { type: "video/mp4" }),
+        withExtension(suggestedName, ".mp4"),
+      );
+      reportProgress({ jobId: sessionId, phase: "done", ratio: 1 });
+    } finally {
+      await ff.unmount(FF_INPUT_MOUNT).catch(() => {});
+    }
+  } catch (err) {
+    // Fallback: save the raw captured bytes as `.bin`. Better a partly-
+    // playable file than nothing — many MP4 inspectors will still load it.
+    reportProgress({
+      jobId: sessionId,
+      phase: "saving",
+      ratio: 0.95,
+      message: `Mux failed (${errorMessage(err)}); saving raw capture.`,
+    });
+    await saveBlob(
+      new Blob([await file.arrayBuffer()], { type: "application/octet-stream" }),
+      withExtension(suggestedName, ".bin"),
+    );
+    reportProgress({ jobId: sessionId, phase: "done", ratio: 1 });
+  } finally {
+    // Clean up the OPFS file so a follow-up capture under the same id
+    // doesn't append to the previous run's bytes.
+    await dir.removeEntry(`${sessionId}.bin`).catch(() => {});
+    mseSessionMime.delete(sessionId);
+  }
+}
 
 /* ------------------------- save ------------------------- */
 //

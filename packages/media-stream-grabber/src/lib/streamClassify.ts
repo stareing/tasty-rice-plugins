@@ -1,4 +1,4 @@
-import { siteFilenameHint } from "./siteRules";
+import { siteFilenameHint, siteFilenameHintAsync } from "./siteRules";
 import type { StreamKind } from "./types";
 
 const HLS_PATTERNS = [/\.m3u8(\?|$|#)/i, /application\/(vnd\.apple\.)?mpegurl/i];
@@ -6,6 +6,35 @@ const DASH_PATTERNS = [/\.mpd(\?|$|#)/i, /application\/dash\+xml/i];
 const VIDEO_EXT = /\.(mp4|m4v|mkv|webm|mov|ts|flv)(\?|$|#)/i;
 const AUDIO_EXT = /\.(mp3|m4a|aac|ogg|opus|flac|wav)(\?|$|#)/i;
 const IMAGE_EXT = /\.(jpe?g|png|gif|webp|avif|bmp|svg)(\?|$|#)/i;
+
+/**
+ * Subtitles + danmaku ("comment scrolling overlay") share a single "text"
+ * kind because they're treated identically downstream — direct download,
+ * no remux. Patterns split into two pools so we can attach a friendlier
+ * sub-label later if the popup wants it; matching either qualifies the URL
+ * as kind=text.
+ *
+ * Subtitle file extensions: WebVTT (.vtt), SubRip (.srt), Advanced SSA
+ * (.ass / .ssa), TTML (.ttml / .dfxp), generic (.sub).
+ *
+ * Danmaku endpoints: Bilibili's two well-known shapes — `comment.bilibili.com/<cid>.xml`
+ * for the legacy XML danmaku and `api.bilibili.com/x/v2/dm/web/seg.so` /
+ * `…/list.so` for the protobuf v2 segments. Plus generic path-based hints
+ * (`/danmaku/`, `/danmu/`) used by independent player SDKs and a handful of
+ * regional sites.
+ *
+ * The danmaku patterns are deliberately path-specific (no bare `.xml` or
+ * `.protobuf`) — XML and protobuf are far too generic to classify as media
+ * on their own.
+ */
+const SUBTITLE_EXT = /\.(vtt|srt|ass|ssa|ttml|dfxp|sub)(\?|$|#)/i;
+const DANMAKU_PATTERNS = [
+  /comment\.bilibili\.com\/[^/]+\.xml(\?|$|#)/i,
+  /\/x\/v\d+\/dm\/(?:web\/)?(?:seg\.so|list\.so)/i,
+  /\/danmaku\//i,
+  /\/danmu\//i,
+];
+const SUBTITLE_CT = /^(text\/vtt|application\/x-subrip|application\/ttml\+xml)/i;
 
 const FILENAME_FORBIDDEN = /[\\/:*?"<>|]+/g;
 const FILENAME_TRIM = /^[.\s]+|[.\s]+$/g;
@@ -21,6 +50,12 @@ export function classify(url: string, contentType?: string): StreamKind | null {
   if (ct.startsWith("video/") || VIDEO_EXT.test(u)) return "mp4";
   if (ct.startsWith("audio/") || AUDIO_EXT.test(u)) return "audio";
   if (ct.startsWith("image/") || IMAGE_EXT.test(u)) return "image";
+
+  // Subtitle / danmaku resources. URL extension is checked before
+  // content-type because some CDNs serve `.vtt` as `text/plain`.
+  if (SUBTITLE_EXT.test(u)) return "text";
+  if (DANMAKU_PATTERNS.some((re) => re.test(u))) return "text";
+  if (ct && SUBTITLE_CT.test(ct)) return "text";
 
   return null;
 }
@@ -62,6 +97,10 @@ function withExt(slug: string, ext: string): string {
  *      to a known site — covers titleless tabs and embedded players.
  *   3. URL basename, stripped of `.m3u8` / `.mpd` suffixes.
  * HLS / DASH always end .mp4.
+ *
+ * Synchronous variant — used in places where awaiting a storage roundtrip
+ * is awkward (the popup's optimistic UI). The async variant below
+ * additionally honours user-defined site rules from chrome.storage.local.
  */
 export function suggestedFilename(
   url: string,
@@ -83,6 +122,29 @@ export function suggestedFilename(
   const stripped = base.replace(/\.(m3u8|mpd)(\?.*)?$/i, "");
   const slug = slugify(stripped) || "stream";
   return withExt(slug, ext);
+}
+
+/**
+ * Filename derivation with user-defined rule lookup. Falls back to
+ * `suggestedFilename` when no user rule matches.
+ */
+export async function suggestedFilenameAsync(
+  url: string,
+  kind: StreamKind,
+  pageTitle?: string,
+  pageUrl?: string,
+): Promise<string> {
+  const ext = extensionFor(kind, url);
+  if (pageTitle) {
+    const slug = slugify(pageTitle);
+    if (slug) return withExt(slug, ext);
+  }
+  const hint = await siteFilenameHintAsync(pageUrl);
+  if (hint) {
+    const slug = slugify(hint);
+    if (slug) return withExt(slug, ext);
+  }
+  return suggestedFilename(url, kind, pageTitle, pageUrl);
 }
 
 /** djb2 hash → base36; cheap, no crypto needed. */

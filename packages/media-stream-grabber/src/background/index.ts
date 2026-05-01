@@ -23,20 +23,71 @@
 
 import type {
   DetectedStream,
+  FocusContext,
+  ManagedJobRecord,
   PersistedJob,
   RuntimeMessage,
 } from "@/lib/types";
-import { classify, hashId, suggestedFilename } from "@/lib/streamClassify";
-import { installBridge, installCrawler } from "./injected";
+import {
+  classify,
+  hashId,
+  suggestedFilename,
+  suggestedFilenameAsync,
+} from "@/lib/streamClassify";
+import { scoreStream } from "@/lib/streamScore";
+import { installBridge, installCrawler, installProxyFetch } from "./injected";
 
 const STREAM_SEGMENT_RE = /\.(ts|m4s|cmfv|cmfa|mp4v|mp4a)(\?|$|#)/i;
-const HLS_CHILD_PLAYLIST_RE = /(_(?:\d+w|audio|video|v\d+|a\d+)|-(?:video|audio|av)\d*)\.m3u8(\?|$|#)/i;
+/**
+ * URL fingerprints for the major DRM license servers. Matched against the
+ * outgoing webRequest URL — when one fires inside an armed tab we mark the
+ * tab as DRM-protected so the popup can warn before a wasted download.
+ *
+ * The patterns favour false negatives over false positives: a `.../license/`
+ * suffix on a non-DRM resource is rare, but a "license"-shaped path on an
+ * unrelated CDN endpoint shouldn't poison the flag. Where we can be more
+ * specific (Widevine "proxy-license", PlayReady ".../Rights/", FairPlay
+ * "FPSCertificate"), we are.
+ */
+const LICENSE_URL_PATTERNS: { name: string; re: RegExp }[] = [
+  { name: "Widevine", re: /\/widevine(?:\/|[?_-])/i },
+  { name: "Widevine", re: /\/(?:proxy-)?license(?:[?/]|$)/i },
+  { name: "PlayReady", re: /\/playready(?:\/|[?_-])/i },
+  { name: "PlayReady", re: /\/Rights(?:Manager)?(?:\.svc|\/)/i },
+  { name: "FairPlay", re: /\/fairplay(?:\/|[?_-])/i },
+  { name: "FairPlay", re: /\/FPSCertificate/i },
+  { name: "DRM", re: /\/keyserver(?:\/|[?_-])/i },
+  { name: "DRM", re: /\/(?:get)?license[s]?(?:\?|$)/i },
+];
+
+function detectLicenseUrl(url: string): string | undefined {
+  for (const p of LICENSE_URL_PATTERNS) {
+    if (p.re.test(url)) return p.name;
+  }
+  return undefined;
+}
+/**
+ * Patterns that mark an `.m3u8` URL as an ABR child playlist. Any match
+ * means we'll fold the URL onto its parent master via `canonicalHlsMasterUrl`.
+ *
+ *   - `_1080w` / `_video` / `-audio` / `_v1` / `_a2` — common TV/CDN naming
+ *   - `_720p` / `-1080p_4500k` — height / bitrate suffixes
+ *   - `index_3` / `chunklist_w012345.m3u8` — Wowza / Akamai conventions
+ *   - `track_2.m3u8` — DASH-derived HLS exports
+ *
+ * Everything is collapsed back to `<basename>.m3u8` for the dedupe key only;
+ * `stream.url` keeps the actual sniffed URL so downloads still target what
+ * the CDN actually serves.
+ */
+const HLS_CHILD_PLAYLIST_RE =
+  /(_(?:\d+w|\d+p|audio|video|v\d+|a\d+|\d+k|\d+kbps|hd|sd)|-(?:video|audio|av|\d+p|\d+kbps?)\d*|index_\w+|chunklist[_-]?\w*|track[_-]?\d+|playlist[_-]?\w*)\.m3u8(\?|$|#)/i;
 const MAX_STREAMS_PER_TAB = 64;
 const SESSION_KEY = "msg.streamsByTab.v1";
 const JOBS_KEY = "msg.jobs.v1";
 const ARMED_KEY = "msg.armedUntil.v1";
 const ARMED_FRAME_KEY = "msg.armedFrame.v1";
 const PAGE_SNIFF_KEY = "msg.pageSniff.v1";
+const FOCUS_KEY = "msg.focusByTab.v1";
 const DNR_RULE_BASE = 9000;
 const CAPTURE_WINDOW_MS = 30_000;
 const PAGE_SNIFF_ARM_MS = 365 * 24 * 60 * 60 * 1000;
@@ -61,6 +112,36 @@ let armedFrame: Map<number, number> = new Map();
  * (no silent observation of pages the user hasn't opted in to).
  */
 let pageSniffTabs: Set<number> = new Set();
+/**
+ * Latest right-click focus per tab — feeds `scoreStream()` so sniffed rows
+ * that originate from the same frame, soon after the click, on the same
+ * host as the clicked element rank above tab-wide noise. Cleared on
+ * navigation / tab close in lockstep with `streamsByTab`.
+ */
+let focusByTab: Map<number, FocusContext> = new Map();
+/**
+ * Per-tab DRM / MSE detection cache. Populated by the page-side crawler's
+ * `streams:report-flag` events; applied to existing streams immediately and
+ * to streams that arrive afterwards inside `admitStream`. Cleared on
+ * navigation / tab close in lockstep with the other tab-bound state.
+ */
+const tabFlags: Map<number, { drm?: boolean; mse?: boolean }> = new Map();
+
+/**
+ * Tabs that have MSE capture armed. Per-session chunk-stats accumulate as
+ * `mse:chunk` messages flow in; the popup queries `mse:status:query` for
+ * a snapshot.
+ */
+const mseCaptureTabs = new Set<number>();
+interface MseSessionStats {
+  sessionId: string;
+  tabId: number;
+  mimeType?: string;
+  bytes: number;
+  chunks: number;
+  startedAt: number;
+}
+const mseSessions = new Map<string, MseSessionStats>();
 let restored = false;
 let offscreenReady = false;
 let offscreenReadyWaiters: Array<() => void> = [];
@@ -75,6 +156,7 @@ async function restoreFromSession(): Promise<void> {
       ARMED_KEY,
       ARMED_FRAME_KEY,
       PAGE_SNIFF_KEY,
+      FOCUS_KEY,
     ]);
     const rawStreams = data[SESSION_KEY] as Record<string, DetectedStream[]> | undefined;
     if (rawStreams) {
@@ -108,6 +190,14 @@ async function restoreFromSession(): Promise<void> {
     const rawPageSniff = data[PAGE_SNIFF_KEY] as number[] | undefined;
     if (Array.isArray(rawPageSniff)) {
       pageSniffTabs = new Set(rawPageSniff.filter((n) => Number.isFinite(n)));
+    }
+    const rawFocus = data[FOCUS_KEY] as Record<string, FocusContext> | undefined;
+    if (rawFocus) {
+      focusByTab = new Map(
+        Object.entries(rawFocus)
+          .map(([k, v]) => [Number(k), v] as [number, FocusContext])
+          .filter(([tabId]) => Number.isFinite(tabId)),
+      );
     }
   } catch {
     /* session storage unavailable — non-fatal */
@@ -157,6 +247,47 @@ async function persistPageSniff(): Promise<void> {
   } catch {
     /* ignore */
   }
+}
+
+async function persistFocus(): Promise<void> {
+  const obj: Record<string, FocusContext> = {};
+  for (const [k, v] of focusByTab) obj[String(k)] = v;
+  try {
+    await chrome.storage.session.set({ [FOCUS_KEY]: obj });
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Record a right-click focus for `tabId`. The focus snapshot feeds
+ * `scoreStream()` for ~5 minutes — long enough that streams sniffed after
+ * the user actually starts playback still benefit, short enough that an
+ * abandoned click doesn't keep biasing future sniffs forever. Persisted
+ * to session storage so an SW evict doesn't lose the bias mid-arm.
+ */
+function recordFocus(focus: FocusContext): void {
+  focusByTab.set(focus.tabId, focus);
+  void persistFocus();
+}
+
+function snapshotMseSessions(tabId: number): {
+  sessionId: string;
+  mimeType?: string;
+  bytes: number;
+  chunks: number;
+}[] {
+  const out: { sessionId: string; mimeType?: string; bytes: number; chunks: number }[] = [];
+  for (const stat of mseSessions.values()) {
+    if (stat.tabId !== tabId) continue;
+    out.push({
+      sessionId: stat.sessionId,
+      mimeType: stat.mimeType,
+      bytes: stat.bytes,
+      chunks: stat.chunks,
+    });
+  }
+  return out;
 }
 
 function isBurstArmed(tabId: number): boolean {
@@ -227,6 +358,7 @@ async function injectPageCrawler(
   tabId: number,
   until: number,
   frameId?: number,
+  mseCapture?: boolean,
 ): Promise<void> {
   if (!chrome.scripting?.executeScript) return;
   const nonce = `${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 10)}`;
@@ -250,11 +382,33 @@ async function injectPageCrawler(
     return;
   }
   try {
+    // mseCapture defaults to whatever the SW currently tracks for this
+    // tab. Callers that don't pass it (the burst-arm path, page-sniff
+    // toggle) inherit the existing flag instead of accidentally turning
+    // capture off because they didn't specify.
+    const captureFlag =
+      typeof mseCapture === "boolean" ? mseCapture : mseCaptureTabs.has(tabId);
     await chrome.scripting.executeScript({
       target,
       world: "MAIN" as chrome.scripting.ExecutionWorld,
       func: installCrawler,
-      args: [{ nonce, armedUntil: until }],
+      args: [{ nonce, armedUntil: until, mseCapture: captureFlag }],
+      injectImmediately: true,
+    });
+  } catch {
+    /* MAIN-world injection refused — webRequest sniffer carries on */
+  }
+  // The proxy-fetch endpoint shares the same nonce as the crawler; it
+  // simply enables the page to refetch on the offscreen's behalf when a
+  // CDN rejects the offscreen's direct request. Install only after the
+  // bridge above succeeded — without the ISOLATED-world bridge the proxy
+  // hook can't be reached.
+  try {
+    await chrome.scripting.executeScript({
+      target,
+      world: "MAIN" as chrome.scripting.ExecutionWorld,
+      func: installProxyFetch,
+      args: [{ nonce }],
       injectImmediately: true,
     });
   } catch {
@@ -289,6 +443,7 @@ async function admitStream(args: {
   pageTitle?: string;
   frameId?: number;
   referer?: string;
+  source?: DetectedStream["source"];
 }): Promise<DetectedStream | undefined> {
   const { tabId, url } = args;
   if (!url || url.startsWith("blob:") || url.startsWith("data:")) return undefined;
@@ -307,18 +462,34 @@ async function admitStream(args: {
   // use a canonical *key* purely for dedupe so multiple child variants
   // of the same master collapse into one row.
   const dedupeKey = streamGroupKey(kind, url);
+  const flags = tabFlags.get(tabId);
   const stream: DetectedStream = {
     id: hashId(dedupeKey),
     url,
     kind,
-    suggestedName: suggestedFilename(url, kind, args.pageTitle, args.pageUrl),
+    // User-defined site rules can rewrite the filename hint; the await
+    // here costs one storage roundtrip per *new* stream, cached after
+    // the first lookup. Built-in rules + page-title path remain fully
+    // synchronous through `suggestedFilename`.
+    suggestedName: await suggestedFilenameAsync(
+      url,
+      kind,
+      args.pageTitle,
+      args.pageUrl,
+    ),
     mimeType: args.contentType,
     detectedAt: Date.now(),
     pageUrl: args.pageUrl,
     pageTitle: args.pageTitle,
     frameId: args.frameId,
     referer: args.referer,
+    drmDetected: flags?.drm,
+    mseDetected: flags?.mse,
+    source: args.source ?? "web-request",
   };
+  // Score after the rest of the record is built so all fields the scorer
+  // reads (kind, source, frameId, drmDetected, mseDetected, …) are settled.
+  stream.score = scoreStream(stream, focusByTab.get(tabId), Date.now());
   const added = addStream(tabId, stream);
   if (!added) return undefined;
   void persistStreams();
@@ -335,6 +506,47 @@ async function admitStream(args: {
   void updateBadge(tabId);
   enqueueThumb(tabId, stream);
   return stream;
+}
+
+/**
+ * Mark every existing stream on `tabId` as DRM-protected and rebroadcast the
+ * patched rows so an open popup updates without a fresh sniff. Mirrors the
+ * EME-hook path that came from `streams:report-flag`.
+ */
+async function applyDrmFlagToTab(tabId: number, family: string): Promise<void> {
+  const list = streamsByTab.get(tabId);
+  if (!list) return;
+  let mutated = false;
+  const focus = focusByTab.get(tabId);
+  const now = Date.now();
+  const updated = list.map((s) => {
+    if (s.drmDetected) return s;
+    mutated = true;
+    // DRM penalty changes the score — recompute alongside the flag flip
+    // so the popup re-sorts the row in the same broadcast.
+    const patched: DetectedStream = { ...s, drmDetected: true };
+    patched.score = scoreStream(patched, focus, now);
+    return patched;
+  });
+  if (!mutated) return;
+  streamsByTab.set(tabId, updated);
+  await persistStreams();
+  for (const s of updated) {
+    void chrome.runtime
+      .sendMessage({
+        type: "streams:added",
+        tabId,
+        stream: s,
+        target: "sw",
+      } satisfies RuntimeMessage)
+      .catch(() => {
+        /* popup closed — fine */
+      });
+  }
+  // Cosmetic: family is the licence-server family ("Widevine", …); not
+  // surfaced in UI yet but kept available so the eventual probe path can
+  // cross-check against the per-rendition DRM hints from the manifest.
+  void family;
 }
 
 /** Update an existing stream in place; returns the merged record or undefined. */
@@ -448,43 +660,76 @@ chrome.runtime.onStartup.addListener(() => {
   void rebuildStaticMenus();
 });
 
-async function rebuildStaticMenus(): Promise<void> {
-  await new Promise<void>((resolve) => chrome.contextMenus.removeAll(resolve));
+/**
+ * Dedupes concurrent rebuilds. `onInstalled` and `onStartup` both fire on a
+ * fresh-profile + freshly-installed extension, and their `await removeAll`
+ * resolves in lockstep — without a lock, both then call `create` with the
+ * same ids and the second batch fails with "Cannot create item with
+ * duplicate id". A single in-flight promise lets the second caller observe
+ * the first's completion instead of racing the create calls.
+ */
+let menuRebuildInflight: Promise<void> | null = null;
+
+function rebuildStaticMenus(): Promise<void> {
+  if (menuRebuildInflight) return menuRebuildInflight;
+  menuRebuildInflight = (async () => {
+    try {
+      await new Promise<void>((resolve) => chrome.contextMenus.removeAll(() => {
+        // Discard removeAll's lastError — happens on cold install when
+        // the menu set is already empty. We're about to recreate them.
+        void chrome.runtime.lastError;
+        resolve();
+      }));
+      createStaticMenus();
+    } finally {
+      menuRebuildInflight = null;
+    }
+  })();
+  return menuRebuildInflight;
+}
+
+function createStaticMenus(): void {
+  // Each create's duplicate-id failure is delivered via chrome.runtime.lastError
+  // in the callback; without a callback it logs "Unchecked runtime.lastError".
+  // The dedup lock above already prevents the race in normal flow — this just
+  // silences the residual case where Chrome retains menus from the previous SW
+  // life on extension reload.
+  const swallow = () => { void chrome.runtime.lastError; };
   chrome.contextMenus.create({
     id: MENU_PARENT,
     title: "Media Stream Grabber",
     contexts: ["page", "frame", "video", "audio", "image", "link"],
-  });
+  }, swallow);
   chrome.contextMenus.create({
     id: MENU_ARM,
     parentId: MENU_PARENT,
     title: `Capture next ${CAPTURE_WINDOW_MS / 1000}s of media on this tab`,
     contexts: ["page", "frame", "video", "audio"],
-  });
+  }, swallow);
   chrome.contextMenus.create({
     id: MENU_VIDEO,
     parentId: MENU_PARENT,
     title: "Download this video element",
     contexts: ["video"],
-  });
+  }, swallow);
   chrome.contextMenus.create({
     id: MENU_AUDIO,
     parentId: MENU_PARENT,
     title: "Download this audio element",
     contexts: ["audio"],
-  });
+  }, swallow);
   chrome.contextMenus.create({
     id: MENU_IMAGE,
     parentId: MENU_PARENT,
     title: "Download this image",
     contexts: ["image"],
-  });
+  }, swallow);
   chrome.contextMenus.create({
     id: MENU_LINK,
     parentId: MENU_PARENT,
     title: "Download link target",
     contexts: ["link"],
-  });
+  }, swallow);
 }
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
@@ -498,6 +743,33 @@ async function handleContextClick(
   await restoreFromSession();
   const id = String(info.menuItemId);
   const tabId = tab?.id;
+
+  // Focus snapshot feeds scoreStream(): which frame, when, what element.
+  // Recorded for every menu item before the per-id branches, so even the
+  // bare arm path biases subsequent sniffs toward the clicked frame.
+  if (tabId != null) {
+    const tag: FocusContext["mediaTag"] =
+      id === MENU_VIDEO
+        ? "video"
+        : id === MENU_AUDIO
+          ? "audio"
+          : id === MENU_IMAGE
+            ? "image"
+            : id === MENU_LINK
+              ? "link"
+              : "page";
+    const rawSrc = id === MENU_LINK ? info.linkUrl : info.srcUrl;
+    recordFocus({
+      tabId,
+      frameId: info.frameId,
+      clickedAt: Date.now(),
+      srcUrl:
+        rawSrc && !rawSrc.startsWith("blob:") && !rawSrc.startsWith("data:")
+          ? rawSrc
+          : undefined,
+      mediaTag: tag,
+    });
+  }
 
   switch (id) {
     case MENU_ARM: {
@@ -660,9 +932,23 @@ chrome.webRequest.onSendHeaders.addListener(
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
     if (details.tabId < 0) return;
-    if (details.method !== "GET") return;
     if (!isCapturingFrame(details.tabId, details.frameId)) return;
 
+    // License-server fingerprint — fires on the same network round-trip the
+    // EME hook would observe in the page, but webRequest sees the URL even
+    // when the page-side hook is absent (extension installed mid-playback,
+    // injection refused on some host). Apply the flag tab-wide and patch
+    // every existing stream so the popup row updates without re-sniffing.
+    const licenseFamily = detectLicenseUrl(details.url);
+    if (licenseFamily) {
+      const cur = tabFlags.get(details.tabId) || {};
+      if (!cur.drm) {
+        tabFlags.set(details.tabId, { ...cur, drm: true });
+        void applyDrmFlagToTab(details.tabId, licenseFamily);
+      }
+    }
+
+    if (details.method !== "GET") return;
     const contentType = headerLookup(details.responseHeaders, "content-type");
     const kind = classify(details.url, contentType);
     if (!kind) return;
@@ -697,12 +983,19 @@ chrome.tabs.onUpdated.addListener((tabId, change) => {
     streamsByTab.delete(tabId);
     armedUntil.delete(tabId);
     armedFrame.delete(tabId);
+    tabFlags.delete(tabId);
+    focusByTab.delete(tabId);
+    mseCaptureTabs.delete(tabId);
+    for (const [sid, stat] of mseSessions) {
+      if (stat.tabId === tabId) mseSessions.delete(sid);
+    }
     // Page-sniff is also bound to the page the user opted in to. A
     // navigation switches to a different page, so explicit re-opt-in is
     // required — keeps the privacy contract intact.
     const wasSniffing = pageSniffTabs.delete(tabId);
     void persistStreams();
     void persistArmed();
+    void persistFocus();
     if (wasSniffing) void persistPageSniff();
     void updateBadge(tabId);
     if (wasSniffing) {
@@ -723,8 +1016,15 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   armedUntil.delete(tabId);
   armedFrame.delete(tabId);
   pageSniffTabs.delete(tabId);
+  tabFlags.delete(tabId);
+  focusByTab.delete(tabId);
+  mseCaptureTabs.delete(tabId);
+  for (const [sid, stat] of mseSessions) {
+    if (stat.tabId === tabId) mseSessions.delete(sid);
+  }
   void persistStreams();
   void persistArmed();
+  void persistFocus();
   void persistPageSniff();
 });
 
@@ -795,13 +1095,78 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, sender, sendResponse)
           pageUrl: msg.pageUrl ?? tab?.url,
           pageTitle: tab?.title,
           frameId: sender.frameId,
+          source: "page-crawler",
         });
+        sendResponse({ ok: true });
+        return;
+      }
+      case "streams:report-flag": {
+        const tabId = sender.tab?.id;
+        if (tabId == null) {
+          sendResponse({ ok: false, error: "no-tab" });
+          return;
+        }
+        // Same gate as `streams:report-direct` — only honour reports from
+        // tabs the user has actively opted in to (burst arm or page-sniff).
+        // The bridge nonce already authenticated the source page, but we
+        // re-check here because the page can outlive the burst window.
+        if (!isCapturingFrame(tabId, sender.frameId)) {
+          sendResponse({ ok: false, error: "not-armed" });
+          return;
+        }
+        const cur = tabFlags.get(tabId) || {};
+        const next = { ...cur, [msg.flag]: true };
+        tabFlags.set(tabId, next);
+        // Patch every existing stream on the tab so the popup row shows
+        // the badge without waiting for a new sniff. Re-broadcast each
+        // patched record via `streams:added` so an open popup updates
+        // in place (the listener already merges by id).
+        const list = streamsByTab.get(tabId);
+        if (list) {
+          let mutated = false;
+          const focus = focusByTab.get(tabId);
+          const now = Date.now();
+          const updated = list.map((s) => {
+            const patched: DetectedStream = {
+              ...s,
+              drmDetected: msg.flag === "drm" ? true : s.drmDetected,
+              mseDetected: msg.flag === "mse" ? true : s.mseDetected,
+            };
+            if (
+              patched.drmDetected !== s.drmDetected ||
+              patched.mseDetected !== s.mseDetected
+            ) {
+              mutated = true;
+              patched.score = scoreStream(patched, focus, now);
+            }
+            return patched;
+          });
+          if (mutated) {
+            streamsByTab.set(tabId, updated);
+            await persistStreams();
+            for (const s of updated) {
+              void chrome.runtime
+                .sendMessage({
+                  type: "streams:added",
+                  tabId,
+                  stream: s,
+                  target: "sw",
+                } satisfies RuntimeMessage)
+                .catch(() => {
+                  /* popup closed — fine */
+                });
+            }
+          }
+        }
         sendResponse({ ok: true });
         return;
       }
       case "streams:clear": {
         streamsByTab.delete(msg.tabId);
+        tabFlags.delete(msg.tabId);
+        focusByTab.delete(msg.tabId);
         await persistStreams();
+        await persistFocus();
         await updateBadge(msg.tabId);
         sendResponse({ ok: true });
         return;
@@ -869,11 +1234,189 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, sender, sendResponse)
       }
       case "download:start": {
         try {
-          await startDownload(msg.stream, msg.jobId, msg.selection ?? {});
+          await startDownload(
+            msg.stream,
+            msg.jobId,
+            msg.selection ?? {},
+            sender.tab?.id,
+          );
           sendResponse({ ok: true });
         } catch (err) {
           sendResponse({ ok: false, error: (err as Error).message });
         }
+        return;
+      }
+      case "proxy:fetch": {
+        // Offscreen → SW. Find the originating tab, forward to its bridge,
+        // relay the page-fetch reply back. The bridge replies via
+        // `sendResponse`, which arrives here as the awaited resolve value.
+        try {
+          const job = jobsById.get(msg.jobId);
+          const tabId = job?.tabId;
+          if (tabId == null) {
+            sendResponse({ ok: false, status: 0, error: "no-origin-tab" });
+            return;
+          }
+          const reply = await new Promise<{ ok: boolean; status: number; bytes?: Uint8Array; error?: string }>(
+            (resolve) => {
+              try {
+                chrome.tabs.sendMessage(
+                  tabId,
+                  {
+                    target: "page-proxy",
+                    type: "page-proxy:fetch",
+                    url: msg.url,
+                    method: msg.method ?? "GET",
+                    headers: msg.headers ?? {},
+                  },
+                  (resp) => {
+                    const lastErr = chrome.runtime.lastError;
+                    if (lastErr) {
+                      resolve({ ok: false, status: 0, error: lastErr.message || "no-bridge" });
+                      return;
+                    }
+                    resolve(resp ?? { ok: false, status: 0, error: "no-response" });
+                  },
+                );
+              } catch (err) {
+                resolve({ ok: false, status: 0, error: (err as Error).message });
+              }
+            },
+          );
+          sendResponse(reply);
+        } catch (err) {
+          sendResponse({ ok: false, status: 0, error: (err as Error).message });
+        }
+        return;
+      }
+      case "mse:chunk": {
+        // Page → SW relay. The bridge already validated the per-arm nonce
+        // in the page; we trust the SW boundary to authenticate the sender
+        // by extension-id (chrome ensures `sender.id === chrome.runtime.id`).
+        // Reject chunks from tabs that aren't actively capturing — the page
+        // hook can race a disarm in flight.
+        const senderTab = sender.tab?.id;
+        if (senderTab == null || !mseCaptureTabs.has(senderTab)) {
+          sendResponse({ ok: false, error: "not-capturing" });
+          return;
+        }
+        // Tally per-session stats so the popup can show "captured 142 MB
+        // across 3 chunks" without subscribing to every chunk.
+        const stats = mseSessions.get(msg.sessionId) ?? {
+          sessionId: msg.sessionId,
+          tabId: senderTab,
+          mimeType: msg.mimeType,
+          bytes: 0,
+          chunks: 0,
+          startedAt: Date.now(),
+        };
+        stats.bytes += msg.bytes?.byteLength ?? 0;
+        stats.chunks += 1;
+        if (!stats.mimeType && msg.mimeType) stats.mimeType = msg.mimeType;
+        mseSessions.set(msg.sessionId, stats);
+
+        try {
+          await ensureOffscreen();
+          await waitForOffscreenReady();
+          await chrome.runtime
+            .sendMessage({ ...msg, target: "offscreen" } satisfies RuntimeMessage)
+            .catch(() => {
+              /* offscreen will rehydrate next message */
+            });
+          sendResponse({ ok: true });
+        } catch (err) {
+          sendResponse({ ok: false, error: (err as Error).message });
+        }
+        return;
+      }
+      case "mse:finish": {
+        try {
+          await ensureOffscreen();
+          await waitForOffscreenReady();
+          await chrome.runtime
+            .sendMessage({ ...msg, target: "offscreen" } satisfies RuntimeMessage)
+            .catch(() => {});
+          sendResponse({ ok: true });
+        } catch (err) {
+          sendResponse({ ok: false, error: (err as Error).message });
+        }
+        return;
+      }
+      case "mse:arm": {
+        if (msg.enable) {
+          mseCaptureTabs.add(msg.tabId);
+          // Re-inject crawler with mseCapture=true. The hook is idempotent
+          // — only the flag flips; existing hooks stay in place.
+          void injectPageCrawler(
+            msg.tabId,
+            Date.now() + PAGE_SNIFF_ARM_MS,
+            undefined,
+            true,
+          );
+        } else {
+          mseCaptureTabs.delete(msg.tabId);
+          // Drop accumulated session stats for the tab — the offscreen's
+          // OPFS files outlive this and are cleaned up by the orphan sweep.
+          for (const [sid, stat] of mseSessions) {
+            if (stat.tabId === msg.tabId) mseSessions.delete(sid);
+          }
+          // Re-inject with mseCapture=false to silence further chunk forwards.
+          void injectPageCrawler(
+            msg.tabId,
+            Date.now() + PAGE_SNIFF_ARM_MS,
+            undefined,
+            false,
+          );
+        }
+        sendResponse({
+          type: "mse:status",
+          tabId: msg.tabId,
+          active: mseCaptureTabs.has(msg.tabId),
+          sessions: snapshotMseSessions(msg.tabId),
+          target: "sw",
+        } satisfies RuntimeMessage);
+        return;
+      }
+      case "mse:status:query": {
+        sendResponse({
+          type: "mse:status",
+          tabId: msg.tabId,
+          active: mseCaptureTabs.has(msg.tabId),
+          sessions: snapshotMseSessions(msg.tabId),
+          target: "sw",
+        } satisfies RuntimeMessage);
+        return;
+      }
+      case "mse:save": {
+        try {
+          await ensureOffscreen();
+          await waitForOffscreenReady();
+          await chrome.runtime
+            .sendMessage({
+              type: "mse:finish",
+              sessionId: msg.sessionId,
+              suggestedName: msg.suggestedName,
+              saveAs: true,
+              target: "offscreen",
+            } satisfies RuntimeMessage)
+            .catch(() => {});
+          sendResponse({ ok: true });
+        } catch (err) {
+          sendResponse({ ok: false, error: (err as Error).message });
+        }
+        return;
+      }
+      case "jobs:list": {
+        sendResponse({
+          type: "jobs:list:result",
+          jobs: await readManagedJobs(),
+          target: "sw",
+        } satisfies RuntimeMessage);
+        return;
+      }
+      case "jobs:remove": {
+        await removeManagedJob(msg.jobId);
+        sendResponse({ ok: true });
         return;
       }
       case "download:cancel": {
@@ -934,8 +1477,23 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, sender, sendResponse)
         return;
       }
       case "download:progress": {
-        if (msg.payload.phase === "done" || msg.payload.phase === "error") {
-          await dropJob(msg.payload.jobId);
+        // Mirror progress into the managed-job log so the standalone
+        // manager page reflects state without subscribing to the live
+        // broadcast itself.
+        const p = msg.payload;
+        await patchManagedJob(p.jobId, {
+          phase: p.phase,
+          ratio: p.ratio,
+          segmentsDone: p.segmentsDone,
+          segmentsTotal: p.segmentsTotal,
+          retries: p.retries,
+          message: p.message,
+          error: p.phase === "error" ? p.error : undefined,
+          finishedAt:
+            p.phase === "done" || p.phase === "error" ? Date.now() : undefined,
+        });
+        if (p.phase === "done" || p.phase === "error") {
+          await dropJob(p.jobId);
         }
         return;
       }
@@ -955,10 +1513,11 @@ async function startDownload(
   stream: DetectedStream,
   jobId: string,
   selection: { variantUri?: string; audioId?: string; subtitleId?: string },
+  originTabId?: number,
 ): Promise<void> {
   await restoreFromSession();
 
-  if (stream.kind === "mp4" || stream.kind === "audio" || stream.kind === "image") {
+  if (stream.kind === "mp4" || stream.kind === "audio" || stream.kind === "image" || stream.kind === "text") {
     await applyRefererRule(jobId, stream);
     try {
       await chrome.downloads.download({
@@ -984,9 +1543,11 @@ async function startDownload(
     stream,
     selection,
     startedAt: Date.now(),
+    tabId: originTabId,
   };
   jobsById.set(jobId, job);
   await persistJobs();
+  await recordManagedJob(job);
   await applyRefererRule(jobId, stream);
   await ensureOffscreen();
   await waitForOffscreenReady();
@@ -1010,35 +1571,163 @@ async function dropJob(jobId: string): Promise<void> {
   await removeRefererRule(jobId);
 }
 
+/* ----------------- managed-job log (downloads manager) ----------------- */
+//
+// `chrome.storage.session` clears on browser restart — fine for in-flight
+// state but the user's *history* of downloads should outlive a restart.
+// `chrome.storage.local` keeps the manager-page log durable. Cap entries
+// so a long-running install doesn't bloat indefinitely; oldest are trimmed.
+
+const MANAGER_LOG_KEY = "msg.managerLog.v1";
+const MANAGER_LOG_MAX = 200;
+
+async function readManagedJobs(): Promise<ManagedJobRecord[]> {
+  try {
+    const data = await chrome.storage.local.get(MANAGER_LOG_KEY);
+    const raw = data[MANAGER_LOG_KEY] as ManagedJobRecord[] | undefined;
+    return Array.isArray(raw) ? raw : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeManagedJobs(jobs: ManagedJobRecord[]): Promise<void> {
+  try {
+    const trimmed = jobs.slice(-MANAGER_LOG_MAX);
+    await chrome.storage.local.set({ [MANAGER_LOG_KEY]: trimmed });
+  } catch {
+    /* storage.local quota exceeded — non-fatal */
+  }
+}
+
+async function recordManagedJob(job: PersistedJob): Promise<void> {
+  const all = await readManagedJobs();
+  if (all.some((r) => r.jobId === job.jobId)) return;
+  all.push({
+    jobId: job.jobId,
+    stream: job.stream,
+    selection: job.selection,
+    startedAt: job.startedAt,
+    phase: "fetching-playlist",
+    ratio: 0,
+  });
+  await writeManagedJobs(all);
+}
+
+async function patchManagedJob(
+  jobId: string,
+  patch: Partial<ManagedJobRecord>,
+): Promise<void> {
+  const all = await readManagedJobs();
+  const idx = all.findIndex((r) => r.jobId === jobId);
+  if (idx < 0) return;
+  all[idx] = { ...all[idx], ...patch };
+  await writeManagedJobs(all);
+}
+
+async function removeManagedJob(jobId: string): Promise<void> {
+  const all = await readManagedJobs();
+  const next = all.filter((r) => r.jobId !== jobId);
+  if (next.length !== all.length) await writeManagedJobs(next);
+}
+
 function isStreamSegment(url: string): boolean {
   return STREAM_SEGMENT_RE.test(url.split("#")[0]);
 }
+
+// Same shape as HLS_CHILD_PLAYLIST_RE without the trailing `\.m3u8(?…)` —
+// used by the rewrite below. Kept in sync manually because regex composition
+// across flags is awkward in JS.
+const HLS_CHILD_SUFFIX_RE =
+  /(_(?:\d+w|\d+p|audio|video|v\d+|a\d+|\d+k|\d+kbps|hd|sd)|-(?:video|audio|av|\d+p|\d+kbps?)\d*|index_\w+|chunklist[_-]?\w*|track[_-]?\d+|playlist[_-]?\w*)\.m3u8/i;
 
 function canonicalHlsMasterUrl(url: string): string {
   if (!HLS_CHILD_PLAYLIST_RE.test(url)) return url;
   try {
     const u = new URL(url);
-    u.pathname = u.pathname.replace(/(_(?:\d+w|audio|video|v\d+|a\d+)|-(?:video|audio|av)\d*)\.m3u8$/i, ".m3u8");
+    u.pathname = u.pathname.replace(HLS_CHILD_SUFFIX_RE, ".m3u8");
     return u.toString();
   } catch {
-    return url.replace(/(_(?:\d+w|audio|video|v\d+|a\d+)|-(?:video|audio|av)\d*)\.m3u8(\?|$|#)/i, ".m3u8$2");
+    return url.replace(
+      /(_(?:\d+w|\d+p|audio|video|v\d+|a\d+|\d+k|\d+kbps|hd|sd)|-(?:video|audio|av|\d+p|\d+kbps?)\d*|index_\w+|chunklist[_-]?\w*|track[_-]?\d+|playlist[_-]?\w*)\.m3u8(\?|$|#)/i,
+      ".m3u8$2",
+    );
   }
+}
+
+/**
+ * Query-param keys that a CDN typically uses to encode a single rendition's
+ * quality/bandwidth — different values for `resolution` / `quality` / `br`
+ * almost always point at the *same logical stream*, just at different ABR
+ * tiers. Stripping them before computing the dedupe key collapses those
+ * variants onto one row even when the URL pathname is identical.
+ *
+ * Conservative list: only params widely documented as quality knobs across
+ * Akamai, Cloudflare Stream, Bilibili, AWS Elemental, and the major OTT
+ * stacks. Token-shaped params (`token`, `signature`, `expires`) are
+ * deliberately not in this list — they don't change between renditions on
+ * the same job, so leaving them in the key is harmless and removes the
+ * risk of collapsing unrelated streams that happen to share a path.
+ */
+const ABR_QUERY_PARAMS = [
+  "resolution",
+  "quality",
+  "vq",
+  "br",
+  "bitrate",
+  "bw",
+  "bandwidth",
+  "level",
+  "profile",
+  "format",
+  "codec",
+  "codecs",
+  "fmt",
+  "hd",
+  "size",
+  "rate",
+];
+
+/**
+ * Strip ABR-quality query params and return a normalised pathname+query
+ * suitable for a dedupe key. Keeps non-quality params (auth tokens, sig,
+ * expires) so unrelated streams that happen to share a path stay distinct.
+ */
+function normaliseQueryForGroupKey(u: URL): string {
+  const drop = new Set(ABR_QUERY_PARAMS);
+  const remaining: [string, string][] = [];
+  // Iterate snapshot — mutating searchParams while iterating drops entries.
+  u.searchParams.forEach((value, key) => {
+    if (drop.has(key.toLowerCase())) return;
+    remaining.push([key, value]);
+  });
+  remaining.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  const qs = remaining.map(([k, v]) => `${k}=${v}`).join("&");
+  return qs ? `${u.pathname}?${qs}` : u.pathname;
 }
 
 /**
  * Best-effort dedupe key. Two URLs that map to the same key are treated as
  * the same stream — used to collapse the multiple child playlists a master
  * fans out to during ABR. The key includes the canonical-master pathname
- * when the regex recognises it; otherwise we fall back to the URL itself
- * (so unrelated streams stay distinct). The key is **not** the stream URL
- * — we still keep the original sniffed URL on the record, because the
- * canonical-master path can 404 on some CDNs.
+ * when the regex recognises it, plus the surviving non-quality query params
+ * (so different videos that happen to share a `manifest.m3u8` path but
+ * carry different `vid=` tokens stay distinct). The key is **not** the
+ * stream URL — we still keep the original sniffed URL on the record,
+ * because the canonical-master path can 404 on some CDNs.
  */
 function streamGroupKey(kind: DetectedStream["kind"], streamUrl: string): string {
-  if (kind !== "hls") return `${kind}:${streamUrl}`;
+  if (kind !== "hls") {
+    try {
+      const u = new URL(streamUrl);
+      return `${kind}:${u.origin}${normaliseQueryForGroupKey(u)}`;
+    } catch {
+      return `${kind}:${streamUrl}`;
+    }
+  }
   try {
     const u = new URL(canonicalHlsMasterUrl(streamUrl));
-    return `hls:${u.origin}${u.pathname}`;
+    return `hls:${u.origin}${normaliseQueryForGroupKey(u)}`;
   } catch {
     return `hls:${canonicalHlsMasterUrl(streamUrl).split("?")[0].split("#")[0]}`;
   }
@@ -1125,6 +1814,33 @@ async function removeRefererRule(jobId: string): Promise<void> {
   }
 }
 
+/**
+ * Remove session rules in our id range whose owning job is no longer alive.
+ *
+ * A SW crash, browser kill, or any path that bypassed `dropJob` (extension
+ * disable while a job runs, OOM in offscreen, etc.) leaks the corresponding
+ * session rule. Orphans linger for the rest of the browser session, count
+ * against the per-extension session-rule cap, and silently rewrite headers
+ * for unrelated future requests on the same domain. We sweep once per SW
+ * wake — `restoreFromSession` has just rebuilt `jobsById`, so anything
+ * outside that set is by definition orphaned.
+ */
+async function sweepOrphanedReferRules(): Promise<void> {
+  if (!chrome.declarativeNetRequest?.getSessionRules) return;
+  try {
+    const existing = await chrome.declarativeNetRequest.getSessionRules();
+    const live = new Set<number>();
+    for (const jobId of jobsById.keys()) live.add(ruleIdFor(jobId));
+    const stale = existing
+      .map((r) => r.id)
+      .filter((id) => id >= DNR_RULE_BASE && id < DNR_RULE_BASE + 100_000 && !live.has(id));
+    if (!stale.length) return;
+    await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: stale });
+  } catch {
+    /* DNR may reject the query on certain Chrome versions — non-fatal */
+  }
+}
+
 /* ----------------------------- offscreen lifecycle ------------------------ */
 
 const OFFSCREEN_PATH = "src/offscreen/index.html";
@@ -1164,6 +1880,7 @@ function waitForOffscreenReady(): Promise<void> {
 
 void (async () => {
   await restoreFromSession();
+  await sweepOrphanedReferRules();
   if (jobsById.size) {
     await ensureOffscreen();
     await waitForOffscreenReady();

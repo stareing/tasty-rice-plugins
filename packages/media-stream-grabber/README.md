@@ -12,31 +12,51 @@ them into a playable MP4 via `ffmpeg.wasm` running in an offscreen document.
 
 - **TypeScript** + **React** + **Vite**
 - `@crxjs/vite-plugin` for MV3 bundling
-- `@ffmpeg/ffmpeg` 0.12 (loaded at runtime from unpkg, ~30 MB but cached)
-- Chrome `webRequest` + `offscreen` + `downloads` APIs
+- `@ffmpeg/ffmpeg` 0.12 — bundled locally (no unpkg fetch at runtime), single-thread build
+- Chrome `webRequest` + `offscreen` + `declarativeNetRequest` + `downloads` APIs
 
 ## Project layout
 
 ```
 src/
-├── background/index.ts   # Service worker — right-click menu, gated webRequest
-│                         #   sniffer (only fires while a tab is "armed"),
-│                         #   message router, DNR Referer rules, job persistence,
-│                         #   offscreen handshake gating
-├── popup/                # React popup (action UI + variant/audio/subtitle picker
-│                         #   + arm-capture button + countdown)
+├── background/
+│   ├── index.ts          # Service worker — right-click menu, gated webRequest
+│   │                     #   sniffer (only fires for armed tabs / armed frames),
+│   │                     #   message router, DNR Referer rules, job persistence,
+│   │                     #   focus context capture for the scorer
+│   └── injected.ts       # MAIN-world page hooks (installed only after the user
+│                         #   arms a tab) — <video>/<audio> retro sweep,
+│                         #   fetch/XHR/JSON.parse instrumentation that surfaces
+│                         #   inline m3u8/mpd URLs the SW's webRequest can't see,
+│                         #   DRM (EME) + MSE detection, optional appendBuffer mirror
+├── popup/                # React popup (action UI, batch-download queue,
+│                         #   variant/audio/subtitle picker, arm + sniff + MSE
+│                         #   capture toggles, FOCUS confidence badges)
+├── manager/              # Standalone "Downloads" page (chrome.storage.local
+│                         #   mirror of every job, live progress via broadcasts,
+│                         #   retry / cancel / remove)
+├── options/              # Standalone options page — per-site filename rules
+│                         #   (host suffix + URL regex + filename template)
 ├── offscreen/            # Offscreen doc — HLS + DASH pipelines, ffmpeg.wasm,
-│                         #   IndexedDB-backed segment resume, WebVTT subtitle merge
+│                         #   IndexedDB-backed segment resume, WebVTT subtitle merge,
+│                         #   MSE appendBuffer capture writer (OPFS)
 └── lib/
-    ├── types.ts          # Shared message + stream types (target-routed envelope)
+    ├── types.ts          # Shared message + stream types (target-routed envelope,
+    │                     #   FocusContext, ManagedJobRecord, …)
     ├── streamClassify.ts # URL/Content-Type → StreamKind, filename slugifier
+    ├── streamScore.ts    # Pure scorer ranking sniffed streams against the
+    │                     #   recorded right-click focus (frame, time, host, kind)
+    ├── siteRules.ts      # Built-in + user-defined per-site filename overrides
     ├── m3u8.ts           # HLS playlist parser (master, media, EXT-X-MAP/MEDIA,
     │                     #   AES-128 with rotation, EXT-X-MEDIA-SEQUENCE)
     └── mpd.ts            # DASH MPD parser (SegmentTemplate, SegmentTimeline)
 ```
 
-There is intentionally no content script: an `all_urls` content script would
-violate the right-click-only capture contract.
+The `installCrawler` MAIN-world hook in `background/injected.ts` is **only**
+injected via `chrome.scripting.executeScript` after the user opts in (right-
+click arm or "Sniff page" toggle). There is no `content_scripts` manifest
+entry — a passive `all_urls` content script would violate the
+opt-in-only capture contract.
 
 ## Develop
 
@@ -77,23 +97,60 @@ from source" path — see [`INSTALL.md`](./INSTALL.md) (English) /
 
 ## How to use
 
-The extension does nothing on its own. The right-click menu is the entry
-point for every download.
+The extension does nothing on its own. The right-click menu and the popup
+toggles are the only entry points; nothing observes the network until you opt
+in.
 
-| You want to…                                | Right-click → Media Stream Grabber → …                                                |
-| ------------------------------------------- | ------------------------------------------------------------------------------------- |
+| You want to…                                 | Right-click → Media Stream Grabber → …                                                |
+| -------------------------------------------- | ------------------------------------------------------------------------------------- |
 | Grab the HLS / DASH stream a player is using | **Capture next 30s of media on this tab**, then start (or restart) playback           |
-| Save a `<video>`/`<audio>` with a real `src`| **Download this video element** / **Download this audio element**                     |
+| Save a `<video>`/`<audio>` with a real `src` | **Download this video element** / **Download this audio element**                     |
 | Save the file behind a link                  | **Download link target**                                                              |
 | Save an image                                | **Download this image**                                                               |
 
 When **Capture** is armed the toolbar badge turns red with a `•`. If anything
 is captured during the window, the badge switches to a count and the popup
-lists every detected URL with resolution/audio/subtitle pickers.
+lists every detected URL with resolution / audio / subtitle pickers.
 
-The popup also has an **Arm capture** button if you prefer the keyboard /
-toolbar path over the right-click menu — both routes go through the same
-30-second tab-scoped window.
+### Smart sniffing — focus scoring
+
+Right-clicking on a `<video>` element records a `FocusContext` (tab, frame,
+click time, the element's `src`, the menu item picked) and every sniffed
+stream is scored 0–100 against it. The popup sorts the list score-first, so
+the player you actually pointed at outranks ad iframes, sibling players, and
+preload requests on the same page. Rows with score ≥ 70 get a green **FOCUS**
+badge — these are the ones you almost certainly meant to grab.
+
+Scoring runs entirely in the SW and is purely local. It uses signals already
+on the stream record — `kind`, `source` (`web-request` vs `page-crawler`),
+`frameId`, `detectedAt`, `mseDetected`, `drmDetected`, host of `pageUrl` and
+`url` — plus the recorded focus. No `chrome.debugger`, no extra permissions.
+
+### Popup affordances
+
+In addition to the right-click menu, the popup gives you:
+
+- **Arm capture** — same 30-second tab-scoped window as the right-click item.
+- **Sniff page** — long-lived tab-wide capture. Stays on until you stop it or
+  the page navigates. The only mode that surfaces images.
+- **Capture MSE** — opt-in mirror of every `SourceBuffer.appendBuffer` payload.
+  The offscreen document writes the chunks to OPFS and remuxes on **Save**;
+  use this when the page only exposes `blob:` URLs and the segments have
+  already been decrypted in the player.
+- **Batch download** — checkbox per row plus a top-bar "Download N" button.
+  Runs strictly sequentially (HLS jobs sharing ffmpeg / IndexedDB / DNR rules
+  cannot safely run in parallel). Toggle **Auto recommended** to bypass the
+  variant picker and take the SW-recommended rendition for every job.
+
+### Standalone pages
+
+| Page                                                   | URL fragment              | What it's for                                            |
+| ------------------------------------------------------ | ------------------------- | -------------------------------------------------------- |
+| **Downloads** (`src/manager/`)                         | `src/manager/index.html`  | Persistent log of every job, with retry / cancel / remove. Mirrors the `chrome.storage.local` job log. |
+| **Options** (`src/options/`)                           | `src/options/index.html`  | Per-site filename overrides — host suffix, URL regex with one capture group, filename template using `${name}` / `${id}` / `${title}`. |
+
+The popup links to both via `chrome.runtime.getURL(...)`; Options is also the
+extension's standard "options page".
 
 ## What it currently handles
 
@@ -114,33 +171,46 @@ toolbar path over the right-click menu — both routes go through the same
 | Resume across browser restart           | ✅ Per-segment IndexedDB cache (`${jobId}::v\|a::idx`)            |
 | Referer-locked CDNs                     | ✅ DNR session rule injects `Referer` / `Origin` for the job      |
 | Right-click direct download             | ✅ srcUrl / linkUrl from the click is used immediately            |
-| MSE / `blob:` URLs                      | ⚠️ Right-click arms a 30s capture window — restart playback so the manifest fetches become visible |
+| Right-click focus scoring               | ✅ Streams ranked against click frame / time / host; FOCUS badge ≥70 |
+| Page-side fetch/XHR/JSON.parse hooks    | ✅ `installCrawler` (MAIN world) — surfaces inline m3u8/mpd       |
+| Page-sniff mode (long-lived tab capture)| ✅ Toggle from popup; includes images; expires on navigation only |
+| Batch download (sequential queue)       | ✅ Checkbox per row + Auto-recommended toggle for HLS/DASH        |
+| MSE appendBuffer capture                | ✅ Opt-in popup toggle; chunks → OPFS → ffmpeg remux on Save      |
+| MSE / `blob:` URLs without MSE capture  | ⚠️ Arm a 30s window — restart playback so the manifest fetches become visible |
 | HLS SAMPLE-AES, DASH DRM (Widevine)     | ❌ Out of scope — segments stay encrypted                         |
 
 ## Permissions explained
 
 - `webRequest` + `host_permissions: <all_urls>` — required so that, **only
-  while a tab is armed via the right-click menu**, the extension can observe
-  manifest responses on whatever site you're on. The listener early-returns
-  on every other tab and outside the 30-second capture window. **Read-only.**
+  while a tab is armed (right-click) or in page-sniff mode (popup toggle)**,
+  the extension can observe manifest responses on whatever site you're on.
+  The listener early-returns on every other tab and outside the capture
+  window. **Read-only.**
 - `declarativeNetRequestWithHostAccess` — used only while a download is
   running, to inject the page's `Referer` / `Origin` into outbound segment
   fetches so CDNs don't 403. Rule is removed when the job ends.
+- `scripting` — required to inject the MAIN-world `installCrawler` hook
+  into a tab once the user opts in. The hook surfaces fetch/XHR-only manifest
+  URLs the SW's webRequest can't see (e.g. URLs the player constructs from
+  inline JSON config). Idempotent; gated on the same arm/sniff state as
+  `webRequest`. Never installed automatically.
 - `downloads` — to save files.
 - `offscreen` — to host `ffmpeg.wasm` (service workers can't run wasm reliably).
-- `storage` — `chrome.storage.session` for per-tab stream state and active job
-  resume across service-worker eviction.
-- `contextMenus` — dynamic right-click menu listing detected streams.
+- `storage` — `chrome.storage.session` for per-tab stream state, focus
+  context, and active job resume across service-worker eviction;
+  `chrome.storage.local` for the long-lived Downloads-manager job log and
+  user-defined site rules from the options page.
+- `contextMenus` — right-click menu entry points.
 - `notifications` — surfaces "no streams sniffed yet" and similar hints.
 - `tabs` / `activeTab` — pull the current tab id and title.
-- `scripting` — reserved for future page-scoped helpers.
 
-No analytics, no remote logging, no auth. The only outbound network call the
-extension makes on its own is fetching `ffmpeg-core.js/.wasm` from unpkg the
-first time you merge an HLS stream.
+No analytics, no remote logging, no auth. The extension does not fetch
+`ffmpeg-core` from the internet — the wasm core is bundled into `dist/` at
+build time, so the extension can run fully offline.
 
 ## Roadmap
 
 - [ ] DASH text Representations: extract WebVTT from fMP4 `wvtt` boxes
-- [ ] Bundle `ffmpeg-core` locally for fully offline operation
 - [ ] Live HLS / dynamic MPD support (currently static playlists only)
+- [ ] Page hydration scan: extract m3u8/mpd from `__INITIAL_STATE__` /
+      `__NEXT_DATA__` JSON without waiting for a fetch hit

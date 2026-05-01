@@ -56,9 +56,21 @@ export default defineManifest({
   },
   // We ship the single-thread ffmpeg-core build, so neither the popup nor
   // the offscreen document need COOP/COEP cross-origin isolation.
+  // The standalone downloads manager + options pages are surfaced as
+  // regular extension URLs so the popup can open them in a new tab via
+  // `chrome.runtime.getURL`.
+  options_ui: {
+    page: "src/options/index.html",
+    open_in_tab: true,
+  },
   web_accessible_resources: [
     {
-      resources: ["src/offscreen/index.html", "assets/*"],
+      resources: [
+        "src/offscreen/index.html",
+        "src/manager/index.html",
+        "src/options/index.html",
+        "assets/*",
+      ],
       matches: ["<all_urls>"],
     },
   ],

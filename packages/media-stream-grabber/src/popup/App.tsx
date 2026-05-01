@@ -11,6 +11,8 @@ import type {
   VariantOption,
 } from "@/lib/types";
 
+const BATCH_AUTO_QUALITY_KEY = "msg.batchAutoQuality.v1";
+
 function useActiveTab(): chrome.tabs.Tab | null {
   const [tab, setTab] = useState<chrome.tabs.Tab | null>(null);
   useEffect(() => {
@@ -27,16 +29,50 @@ function send<T = unknown>(msg: RuntimeMessage): Promise<T> {
   });
 }
 
+// Wait for the SW's probe reply for a single jobId. The handler detaches
+// itself on first match — without the jobId guard, batches running probes
+// back-to-back would cross-resolve.
+function waitForProbeResult(jobId: string): Promise<ProbeResult> {
+  return new Promise((resolve) => {
+    const handler = (msg: RuntimeMessage) => {
+      if (msg.target && msg.target !== "sw") return;
+      if (msg.type !== "download:probe:result" || msg.jobId !== jobId) return;
+      chrome.runtime.onMessage.removeListener(handler);
+      resolve(msg.result);
+    };
+    chrome.runtime.onMessage.addListener(handler);
+  });
+}
+
+// Resolve when the SW reports done/error for jobId — the batch driver awaits
+// this between iterations so we never have two HLS jobs racing for ffmpeg /
+// IndexedDB / DNR rules at the same time.
+function waitForJobEnd(jobId: string): Promise<DownloadProgress> {
+  return new Promise((resolve) => {
+    const handler = (msg: RuntimeMessage) => {
+      if (msg.target && msg.target !== "sw") return;
+      if (msg.type !== "download:progress") return;
+      const p = msg.payload;
+      if (p.jobId !== jobId) return;
+      if (p.phase !== "done" && p.phase !== "error") return;
+      chrome.runtime.onMessage.removeListener(handler);
+      resolve(p);
+    };
+    chrome.runtime.onMessage.addListener(handler);
+  });
+}
+
 const KIND_LABEL: Record<StreamKind, string> = {
   hls: "HLS",
   dash: "DASH",
   mp4: "MP4",
   audio: "AUDIO",
   image: "IMG",
+  text: "TEXT",
   other: "FILE",
 };
 
-type CategoryKey = "all" | "video" | "audio" | "image";
+type CategoryKey = "all" | "video" | "audio" | "image" | "text";
 
 const VIDEO_KINDS: ReadonlySet<StreamKind> = new Set(["hls", "dash", "mp4"]);
 
@@ -44,6 +80,7 @@ function categoryOf(kind: StreamKind): Exclude<CategoryKey, "all"> | null {
   if (VIDEO_KINDS.has(kind)) return "video";
   if (kind === "audio") return "audio";
   if (kind === "image") return "image";
+  if (kind === "text") return "text";
   return null;
 }
 
@@ -52,6 +89,7 @@ const CATEGORIES: { key: CategoryKey; label: string }[] = [
   { key: "video", label: "Video" },
   { key: "audio", label: "Audio" },
   { key: "image", label: "Image" },
+  { key: "text", label: "Subs" },
 ];
 
 interface PendingPicker {
@@ -59,6 +97,19 @@ interface PendingPicker {
   stream: DetectedStream;
   result: ProbeResult;
 }
+
+interface BatchState {
+  total: number;
+  completed: number;
+  currentStreamId?: string;
+}
+
+const EMPTY_PROBE: ProbeResult = {
+  variants: [],
+  audioTracks: [],
+  subtitleTracks: [],
+  singlePlaylist: false,
+};
 
 export function App(): JSX.Element {
   const tab = useActiveTab();
@@ -70,7 +121,20 @@ export function App(): JSX.Element {
   const [thumbsRequesting, setThumbsRequesting] = useState<Set<string>>(() => new Set());
   const [sniffActive, setSniffActive] = useState<boolean>(false);
   const [category, setCategory] = useState<CategoryKey>("all");
+  const [mseActive, setMseActive] = useState<boolean>(false);
+  const [mseSessions, setMseSessions] = useState<
+    { sessionId: string; mimeType?: string; bytes: number; chunks: number }[]
+  >([]);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [autoQuality, setAutoQuality] = useState<boolean>(false);
+  const [batch, setBatch] = useState<BatchState | null>(null);
   const jobToStreamRef = useRef<Map<string, string>>(new Map());
+  // Single-slot resolver for the picker — the batch driver runs sequentially,
+  // so the popup never has to juggle multiple concurrent picks.
+  const pickerResolveRef = useRef<((sel: DownloadSelection | null) => void) | null>(null);
+  // Stop signal for the queue. The currently-running download keeps going
+  // (its per-row Cancel button still works); only the queue advances stop.
+  const batchCancelRef = useRef<boolean>(false);
 
   const refresh = useCallback(async () => {
     if (!tab?.id) return;
@@ -156,29 +220,13 @@ export function App(): JSX.Element {
       ) {
         setSniffActive(msg.active);
       }
-      if (msg.type === "download:probe:result") {
-        setPicker((prev) => {
-          if (!prev || prev.jobId !== msg.jobId) return prev;
-          // Probe-time refusal: live, DRM, or otherwise unfit. Keep the
-          // modal open so the user sees *why* — auto-starting would just
-          // produce a download:progress error a beat later.
-          const refused = msg.result.unsupported || msg.result.isLive;
-          // If the probe came back with no choices and is fine, auto-start.
-          if (
-            !refused &&
-            (msg.result.singlePlaylist || msg.result.variants.length === 0)
-          ) {
-            void send({
-              type: "download:start",
-              stream: prev.stream,
-              jobId: prev.jobId,
-              selection: {},
-            });
-            return null;
-          }
-          return { ...prev, result: msg.result };
-        });
+      if (msg.type === "mse:status" && tab?.id && msg.tabId === tab.id) {
+        setMseActive(msg.active);
+        setMseSessions(msg.sessions);
       }
+      // Probe replies are awaited explicitly by the run driver via
+      // `waitForProbeResult` — keeping a parallel auto-start in this
+      // listener would race the driver and double-dispatch download:start.
     };
     chrome.runtime.onMessage.addListener(handler);
     return () => chrome.runtime.onMessage.removeListener(handler);
@@ -189,7 +237,32 @@ export function App(): JSX.Element {
     await send({ type: "streams:clear", tabId: tab.id });
     setStreams([]);
     setProgress({});
+    setSelectedIds(new Set());
   }, [tab?.id]);
+
+  // Persist the "auto-pick recommended" preference across popup opens — the
+  // batch toolbar is the only place it's set, so a single key is enough.
+  useEffect(() => {
+    chrome.storage.local.get(BATCH_AUTO_QUALITY_KEY).then((got) => {
+      if (got[BATCH_AUTO_QUALITY_KEY] === true) setAutoQuality(true);
+    });
+  }, []);
+
+  // Drop selections whose streams no longer exist (tab navigated, user hit
+  // Clear, etc.) so stale ids can't leak into the next batch.
+  useEffect(() => {
+    setSelectedIds((prev) => {
+      if (prev.size === 0) return prev;
+      const ids = new Set(streams.map((s) => s.id));
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (ids.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [streams]);
 
   const onArm = useCallback(async () => {
     if (!tab?.id) return;
@@ -198,6 +271,49 @@ export function App(): JSX.Element {
       setArmedUntil((resp as Extract<RuntimeMessage, { type: "capture:status" }>).armedUntil);
     }
   }, [tab?.id]);
+
+  // Pull MSE capture state once on mount; updates arrive via mse:status broadcasts.
+  useEffect(() => {
+    if (!tab?.id) return;
+    void send<RuntimeMessage>({ type: "mse:status:query", tabId: tab.id }).then(
+      (resp) => {
+        if (resp && (resp as RuntimeMessage).type === "mse:status") {
+          const m = resp as Extract<RuntimeMessage, { type: "mse:status" }>;
+          setMseActive(m.active);
+          setMseSessions(m.sessions);
+        }
+      },
+    );
+  }, [tab?.id]);
+
+  // Poll session stats while capturing — chunks are throttled by the page,
+  // so a 1s tick is enough to keep the byte counter alive without spam.
+  useEffect(() => {
+    if (!mseActive || !tab?.id) return;
+    const id = setInterval(() => {
+      void send<RuntimeMessage>({
+        type: "mse:status:query",
+        tabId: tab.id!,
+      }).then((resp) => {
+        if (resp && (resp as RuntimeMessage).type === "mse:status") {
+          setMseSessions(
+            (resp as Extract<RuntimeMessage, { type: "mse:status" }>).sessions,
+          );
+        }
+      });
+    }, 1000);
+    return () => clearInterval(id);
+  }, [mseActive, tab?.id]);
+
+  const onToggleMse = useCallback(async () => {
+    if (!tab?.id) return;
+    await send({ type: "mse:arm", tabId: tab.id, enable: !mseActive });
+  }, [tab?.id, mseActive]);
+
+  const onSaveMse = useCallback(async (sessionId: string) => {
+    const name = `mse-capture-${Date.now().toString(36)}`;
+    await send({ type: "mse:save", sessionId, suggestedName: name });
+  }, []);
 
   const onToggleSniff = useCallback(async () => {
     if (!tab?.id) return;
@@ -231,27 +347,166 @@ export function App(): JSX.Element {
     }
   }, []);
 
-  const onDownload = useCallback(async (stream: DetectedStream) => {
-    const jobId = `${stream.id}-${Date.now().toString(36)}`;
-    jobToStreamRef.current.set(jobId, stream.id);
-    setProgress((prev) => ({
-      ...prev,
-      [jobId]: { jobId, phase: "probing", ratio: 0 },
-    }));
-    if (stream.kind === "hls" || stream.kind === "dash") {
-      // Probe first so the user can pick a variant / audio track. The SW
-      // will reply with `download:probe:result`; the listener decides
-      // whether to show the picker or auto-start.
-      setPicker({
-        jobId,
-        stream,
-        result: { variants: [], audioTracks: [], subtitleTracks: [], singlePlaylist: false },
-      });
-      await send({ type: "download:probe", stream, jobId });
-    } else {
-      await send({ type: "download:start", stream, jobId, selection: {} });
-    }
-  }, []);
+  // Drive a single download from start to finish: probe (HLS/DASH only),
+  // pick a selection (auto-recommended or via the modal), start, then await
+  // done/error. Both the per-row Download button and the batch driver call
+  // through here, so there is one source of truth for the flow.
+  const runStreamDownload = useCallback(
+    async (
+      stream: DetectedStream,
+      opts: { autoQuality: boolean },
+    ): Promise<void> => {
+      const jobId = `${stream.id}-${Date.now().toString(36)}`;
+      jobToStreamRef.current.set(jobId, stream.id);
+      setProgress((prev) => ({
+        ...prev,
+        [jobId]: { jobId, phase: "probing", ratio: 0 },
+      }));
+
+      const isManifest = stream.kind === "hls" || stream.kind === "dash";
+
+      if (isManifest) {
+        if (!opts.autoQuality) {
+          // Show the modal in its "probing" placeholder state immediately so
+          // the user knows the click registered.
+          setPicker({ jobId, stream, result: EMPTY_PROBE });
+        }
+
+        // Race the probe against an early-cancel so pressing Close while
+        // still probing aborts the run instead of falling through to a
+        // stale picker once the result eventually arrives.
+        const probePromise = waitForProbeResult(jobId);
+        const earlyCancelPromise = opts.autoQuality
+          ? new Promise<"canceled">(() => {})
+          : new Promise<"canceled">((resolve) => {
+              pickerResolveRef.current = (sel) => {
+                if (sel === null) resolve("canceled");
+              };
+            });
+
+        await send({ type: "download:probe", stream, jobId });
+
+        const racing = await Promise.race([
+          probePromise.then((r) => ({ kind: "probe" as const, result: r })),
+          earlyCancelPromise.then(() => ({ kind: "canceled" as const })),
+        ]);
+
+        if (racing.kind === "canceled") {
+          pickerResolveRef.current = null;
+          setProgress((prev) => {
+            const next = { ...prev };
+            delete next[jobId];
+            return next;
+          });
+          jobToStreamRef.current.delete(jobId);
+          return;
+        }
+
+        // Probe won the race — the cancel resolver above is now dead weight.
+        pickerResolveRef.current = null;
+        const result = racing.result;
+
+        if (result.unsupported || result.isLive) {
+          if (opts.autoQuality) {
+            setProgress((prev) => ({
+              ...prev,
+              [jobId]: {
+                jobId,
+                phase: "error",
+                ratio: 0,
+                error:
+                  result.unsupported?.reason ||
+                  (result.isLive
+                    ? "Live stream — not mergeable."
+                    : "Refused."),
+              },
+            }));
+            return;
+          }
+          // Manual: surface the refusal in the picker; the only action is
+          // Close, which resolves null below.
+          setPicker((prev) =>
+            prev?.jobId === jobId ? { ...prev, result } : prev,
+          );
+          await new Promise<DownloadSelection | null>((resolve) => {
+            pickerResolveRef.current = resolve;
+          });
+          pickerResolveRef.current = null;
+          setProgress((prev) => {
+            const next = { ...prev };
+            delete next[jobId];
+            return next;
+          });
+          jobToStreamRef.current.delete(jobId);
+          return;
+        }
+
+        let selection: DownloadSelection;
+        if (result.singlePlaylist || result.variants.length === 0) {
+          selection = {};
+          if (!opts.autoQuality) {
+            setPicker((prev) => (prev?.jobId === jobId ? null : prev));
+          }
+        } else if (opts.autoQuality) {
+          const playable = result.variants.filter((v) => !v.drm);
+          if (!playable.length) {
+            setProgress((prev) => ({
+              ...prev,
+              [jobId]: {
+                jobId,
+                phase: "error",
+                ratio: 0,
+                error: "All renditions DRM-protected.",
+              },
+            }));
+            return;
+          }
+          const variantUri =
+            result.recommendedVariantUri &&
+            playable.some((v) => v.uri === result.recommendedVariantUri)
+              ? result.recommendedVariantUri
+              : playable[0].uri;
+          selection = {
+            variantUri,
+            audioId: result.recommendedAudioId,
+          };
+        } else {
+          // Update the modal with real choices; await user confirm/cancel.
+          setPicker((prev) =>
+            prev?.jobId === jobId ? { ...prev, result } : prev,
+          );
+          const picked = await new Promise<DownloadSelection | null>((resolve) => {
+            pickerResolveRef.current = resolve;
+          });
+          pickerResolveRef.current = null;
+          if (picked === null) {
+            setProgress((prev) => {
+              const next = { ...prev };
+              delete next[jobId];
+              return next;
+            });
+            jobToStreamRef.current.delete(jobId);
+            return;
+          }
+          selection = picked;
+        }
+
+        await send({ type: "download:start", stream, jobId, selection });
+      } else {
+        await send({ type: "download:start", stream, jobId, selection: {} });
+      }
+
+      await waitForJobEnd(jobId);
+    },
+    [],
+  );
+
+  const onDownload = useCallback(
+    (stream: DetectedStream) => {
+      void runStreamDownload(stream, { autoQuality: false });
+    },
+    [runStreamDownload],
+  );
 
   const onCancel = useCallback(async (jobId: string) => {
     await send({ type: "download:cancel", jobId });
@@ -267,31 +522,99 @@ export function App(): JSX.Element {
     await send({ type: "thumb:request", streamId: stream.id, stream });
   }, [thumbsRequesting]);
 
-  const onPickerConfirm = useCallback(
-    async (selection: DownloadSelection) => {
-      if (!picker) return;
-      await send({
-        type: "download:start",
-        stream: picker.stream,
-        jobId: picker.jobId,
-        selection,
-      });
-      setPicker(null);
-    },
-    [picker],
-  );
+  const onPickerConfirm = useCallback((selection: DownloadSelection) => {
+    setPicker(null);
+    pickerResolveRef.current?.(selection);
+    pickerResolveRef.current = null;
+  }, []);
 
   const onPickerCancel = useCallback(() => {
-    if (picker) {
-      setProgress((prev) => {
-        const next = { ...prev };
-        delete next[picker.jobId];
-        return next;
-      });
-      jobToStreamRef.current.delete(picker.jobId);
+    setPicker(null);
+    pickerResolveRef.current?.(null);
+    pickerResolveRef.current = null;
+  }, []);
+
+  const onToggleSelected = useCallback((id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  // Skip-rules from the spec: never queue images, never queue a stream that
+  // already has an in-flight job, and dedupe by URL/id at queue-build time.
+  const isStreamBatchable = useCallback(
+    (s: DetectedStream): boolean => {
+      if (s.kind === "image") return false;
+      for (const [jobId, sid] of jobToStreamRef.current) {
+        if (sid !== s.id) continue;
+        const p = progress[jobId];
+        if (p && p.phase !== "done" && p.phase !== "error") return false;
+      }
+      return true;
+    },
+    [progress],
+  );
+
+  const onToggleAutoQuality = useCallback(() => {
+    setAutoQuality((prev) => {
+      const next = !prev;
+      void chrome.storage.local.set({ [BATCH_AUTO_QUALITY_KEY]: next });
+      return next;
+    });
+  }, []);
+
+  const onStopBatch = useCallback(() => {
+    batchCancelRef.current = true;
+    // If a picker is open for the current batch item, treat Stop as cancel-
+    // this-item too — otherwise the loop sits forever waiting for input.
+    if (pickerResolveRef.current) {
+      pickerResolveRef.current(null);
+      pickerResolveRef.current = null;
     }
     setPicker(null);
-  }, [picker]);
+  }, []);
+
+  const onStartBatch = useCallback(
+    async (targets: DetectedStream[]) => {
+      if (!targets.length || batch) return;
+      batchCancelRef.current = false;
+      setBatch({
+        total: targets.length,
+        completed: 0,
+        currentStreamId: targets[0].id,
+      });
+      const useAutoQuality = autoQuality;
+      for (let i = 0; i < targets.length; i++) {
+        if (batchCancelRef.current) break;
+        const s = targets[i];
+        setBatch({
+          total: targets.length,
+          completed: i,
+          currentStreamId: s.id,
+        });
+        try {
+          await runStreamDownload(s, { autoQuality: useAutoQuality });
+        } catch {
+          // Per-job error is already surfaced via download:progress; keep
+          // the queue moving.
+        }
+        // Drop the row from the selection so re-clicking Download doesn't
+        // re-queue a finished job by accident.
+        setSelectedIds((prev) => {
+          if (!prev.has(s.id)) return prev;
+          const next = new Set(prev);
+          next.delete(s.id);
+          return next;
+        });
+      }
+      setBatch(null);
+      batchCancelRef.current = false;
+    },
+    [autoQuality, batch, runStreamDownload],
+  );
 
   const progressByStream = useMemo(() => {
     const map: Record<string, DownloadProgress> = {};
@@ -303,7 +626,7 @@ export function App(): JSX.Element {
   }, [progress]);
 
   const counts = useMemo(() => {
-    const c = { all: streams.length, video: 0, audio: 0, image: 0 };
+    const c: Record<CategoryKey, number> = { all: streams.length, video: 0, audio: 0, image: 0, text: 0 };
     for (const s of streams) {
       const cat = categoryOf(s.kind);
       if (cat) c[cat]++;
@@ -312,9 +635,72 @@ export function App(): JSX.Element {
   }, [streams]);
 
   const visibleStreams = useMemo(() => {
-    if (category === "all") return streams;
-    return streams.filter((s) => categoryOf(s.kind) === category);
+    const inCategory =
+      category === "all"
+        ? streams
+        : streams.filter((s) => categoryOf(s.kind) === category);
+    // Score-first ordering surfaces the right-click target above tab-wide
+    // noise (preloads, ad iframes, sibling players). detectedAt breaks ties
+    // so newer rows still win when two scores match — the SW sets a sane
+    // default score on every insert, but treat undefined as 0 to avoid an
+    // unranked row floating randomly between scored ones.
+    return [...inCategory].sort((a, b) => {
+      const sa = a.score ?? 0;
+      const sb = b.score ?? 0;
+      if (sa !== sb) return sb - sa;
+      return b.detectedAt - a.detectedAt;
+    });
   }, [streams, category]);
+
+  // "Select all" only operates on what the user can actually queue from the
+  // current category — images and in-flight streams stay untouched.
+  const batchableVisible = useMemo(
+    () => visibleStreams.filter((s) => isStreamBatchable(s)),
+    [visibleStreams, isStreamBatchable],
+  );
+  const visibleSelectedCount = useMemo(
+    () => visibleStreams.filter((s) => selectedIds.has(s.id)).length,
+    [visibleStreams, selectedIds],
+  );
+  const allVisibleSelected =
+    batchableVisible.length > 0 &&
+    batchableVisible.every((s) => selectedIds.has(s.id));
+
+  // Resolve the queue at click time so subsequent sniff events can't change
+  // the batch shape mid-flight. Dedupes by id and URL.
+  const batchTargets = useMemo<DetectedStream[]>(() => {
+    const seenUrls = new Set<string>();
+    const seenIds = new Set<string>();
+    const out: DetectedStream[] = [];
+    for (const s of visibleStreams) {
+      if (!selectedIds.has(s.id)) continue;
+      if (!isStreamBatchable(s)) continue;
+      if (seenIds.has(s.id) || seenUrls.has(s.url)) continue;
+      seenIds.add(s.id);
+      seenUrls.add(s.url);
+      out.push(s);
+    }
+    return out;
+  }, [visibleStreams, selectedIds, isStreamBatchable]);
+
+  const onToggleSelectAllVisible = useCallback(() => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (allVisibleSelected) {
+        for (const s of batchableVisible) next.delete(s.id);
+      } else {
+        for (const s of batchableVisible) next.add(s.id);
+      }
+      return next;
+    });
+  }, [allVisibleSelected, batchableVisible]);
+
+  const onClickDownloadSelected = useCallback(() => {
+    if (!batchTargets.length) return;
+    void onStartBatch(batchTargets);
+  }, [batchTargets, onStartBatch]);
+
+  const batchActive = batch !== null;
 
   return (
     <div className="app">
@@ -322,6 +708,18 @@ export function App(): JSX.Element {
         <span className="app__title">Media Stream Grabber</span>
         <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
           <span className="app__count">{streams.length} found</span>
+          <button
+            className={`app__btn${mseActive ? " app__btn--active" : ""}`}
+            onClick={onToggleMse}
+            disabled={!tab?.id}
+            title={
+              mseActive
+                ? "Stop capturing MediaSource buffer chunks."
+                : "Capture every SourceBuffer.appendBuffer payload on this tab — useful when the page only exposes a blob: URL."
+            }
+          >
+            {mseActive ? "Stop MSE" : "Capture MSE"}
+          </button>
           <button
             className={`app__btn${sniffActive ? " app__btn--active" : ""}`}
             onClick={onToggleSniff}
@@ -346,11 +744,44 @@ export function App(): JSX.Element {
           >
             {isArmed ? `Capturing… ${armedSecondsLeft}s` : "Arm 30s"}
           </button>
+          <button
+            className="app__btn"
+            onClick={() => {
+              void chrome.tabs.create({
+                url: chrome.runtime.getURL("src/manager/index.html"),
+              });
+            }}
+            title="Open the standalone downloads manager"
+          >
+            Manager
+          </button>
           <button className="app__btn" onClick={onClear} disabled={!streams.length}>
             Clear
           </button>
         </div>
       </header>
+
+      {mseActive && mseSessions.length > 0 ? (
+        <div className="stream" style={{ marginBottom: 10 }}>
+          <div className="stream__head">
+            <span className="stream__tag stream__tag--mp4">MSE</span>
+            <span className="stream__name">Captured buffer sessions</span>
+          </div>
+          {mseSessions.map((s) => (
+            <div
+              key={s.sessionId}
+              style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 6 }}
+            >
+              <span className="stream__url" style={{ margin: 0 }}>
+                {s.mimeType ?? "unknown"} · {(s.bytes / 1024 / 1024).toFixed(2)} MB · {s.chunks} chunks
+              </span>
+              <button className="app__btn" onClick={() => onSaveMse(s.sessionId)}>
+                Save
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
 
       <nav className="cats" role="tablist" aria-label="Filter by media type">
         {CATEGORIES.map((c) => (
@@ -367,6 +798,68 @@ export function App(): JSX.Element {
         ))}
       </nav>
 
+      {streams.length > 0 ? (
+        <div className="batchbar">
+          <label
+            className="batchbar__select"
+            title="Toggle every queue-eligible row in this category"
+          >
+            <input
+              type="checkbox"
+              checked={allVisibleSelected}
+              ref={(el) => {
+                if (el)
+                  el.indeterminate =
+                    !allVisibleSelected && visibleSelectedCount > 0;
+              }}
+              onChange={onToggleSelectAllVisible}
+              disabled={batchableVisible.length === 0 || batchActive}
+            />
+            <span>
+              {visibleSelectedCount > 0
+                ? `${visibleSelectedCount} selected`
+                : "Select"}
+            </span>
+          </label>
+          <label
+            className="batchbar__auto"
+            title="HLS/DASH: auto-pick the recommended rendition without showing the picker."
+          >
+            <input
+              type="checkbox"
+              checked={autoQuality}
+              onChange={onToggleAutoQuality}
+              disabled={batchActive}
+            />
+            <span>Auto recommended</span>
+          </label>
+          {batchActive ? (
+            <button
+              className="app__btn"
+              onClick={onStopBatch}
+              title="Stop the queue. The currently-running download keeps going — use its row Cancel button to abort it."
+            >
+              {`Stop (${batch!.completed}/${batch!.total})`}
+            </button>
+          ) : (
+            <button
+              className="app__btn app__btn--active"
+              onClick={onClickDownloadSelected}
+              disabled={batchTargets.length === 0}
+              title={
+                batchTargets.length === 0
+                  ? "Select one or more queue-eligible rows first."
+                  : autoQuality
+                    ? "Run the queue with the recommended rendition for HLS/DASH."
+                    : "Run the queue. HLS/DASH rows show the picker per stream."
+              }
+            >
+              {`Download${batchTargets.length ? ` ${batchTargets.length}` : ""}`}
+            </button>
+          )}
+        </div>
+      ) : null}
+
       {streams.length === 0 ? (
         <div className="empty">
           Nothing captured on this tab.
@@ -382,16 +875,25 @@ export function App(): JSX.Element {
         visibleStreams.map((s) => {
           const job = [...jobToStreamRef.current.entries()].find(([, sid]) => sid === s.id);
           const jobId = job?.[0];
+          const selected = selectedIds.has(s.id);
+          // A row is "selectable" when toggling will register: in-flight or
+          // image rows are skipped, but a stream that's already selected
+          // remains togglable so the user can deselect it after it kicked off.
+          const selectable = selected || isStreamBatchable(s);
           return (
             <StreamCard
               key={s.id}
               stream={s}
               progress={progressByStream[s.id]}
               thumbLoading={thumbsRequesting.has(s.id)}
+              selected={selected}
+              selectable={selectable}
+              batchActive={batchActive}
               onCopy={() => onCopy(s.url)}
               onDownload={() => onDownload(s)}
               onCancel={jobId ? () => onCancel(jobId) : undefined}
               onRequestThumb={() => onRequestThumb(s)}
+              onToggleSelect={() => onToggleSelected(s.id)}
             />
           );
         })
@@ -412,18 +914,26 @@ function StreamCard({
   stream,
   progress,
   thumbLoading,
+  selected,
+  selectable,
+  batchActive,
   onCopy,
   onDownload,
   onCancel,
   onRequestThumb,
+  onToggleSelect,
 }: {
   stream: DetectedStream;
   progress?: DownloadProgress;
   thumbLoading: boolean;
+  selected: boolean;
+  selectable: boolean;
+  batchActive: boolean;
   onCopy: () => void;
   onDownload: () => void;
   onCancel?: () => void;
   onRequestThumb: () => void;
+  onToggleSelect: () => void;
 }): JSX.Element {
   const tagClass = `stream__tag stream__tag--${stream.kind}`;
   const inFlight = progress && progress.phase !== "done" && progress.phase !== "error";
@@ -437,8 +947,25 @@ function StreamCard({
   const showPreviewButton = !stream.thumbDataUrl && canExtract;
 
   return (
-    <div className="stream">
+    <div className={`stream${selected ? " stream--selected" : ""}`}>
       <div className="stream__body">
+        <label
+          className="stream__select"
+          title={
+            selectable
+              ? "Include in batch download"
+              : stream.kind === "image"
+                ? "Image rows are not part of the batch downloader"
+                : "This stream is already downloading"
+          }
+        >
+          <input
+            type="checkbox"
+            checked={selected}
+            onChange={onToggleSelect}
+            disabled={!selectable}
+          />
+        </label>
         <div className={`stream__thumb${thumbSrc ? "" : " stream__thumb--placeholder"}`}>
           {thumbSrc ? (
             <img src={thumbSrc} alt="" loading="lazy" referrerPolicy="no-referrer" onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }} />
@@ -454,6 +981,30 @@ function StreamCard({
             <span className="stream__name" title={stream.suggestedName}>
               {stream.suggestedName}
             </span>
+            {stream.drmDetected ? (
+              <span
+                className="stream__pill stream__pill--drm"
+                title="The page uses Encrypted Media Extensions. Segments will not decode without the license key."
+              >
+                DRM
+              </span>
+            ) : null}
+            {stream.mseDetected && !stream.drmDetected ? (
+              <span
+                className="stream__pill stream__pill--mse"
+                title="The page feeds the player through MediaSource. The visible video.src may be a blob: URL — this row is the underlying source."
+              >
+                MSE
+              </span>
+            ) : null}
+            {(stream.score ?? 0) >= 70 ? (
+              <span
+                className="stream__pill stream__pill--focus"
+                title={`Confidence ${stream.score}/100 — likely the stream you right-clicked.`}
+              >
+                FOCUS
+              </span>
+            ) : null}
           </div>
           <p className="stream__url" title={stream.url}>
             {stream.url}
@@ -470,7 +1021,12 @@ function StreamCard({
         {inFlight && onCancel ? (
           <button onClick={onCancel}>Cancel</button>
         ) : (
-          <button className="primary" onClick={onDownload} disabled={!!inFlight}>
+          <button
+            className="primary"
+            onClick={onDownload}
+            disabled={!!inFlight || batchActive}
+            title={batchActive ? "Batch download is running — wait for the queue to finish or stop it." : undefined}
+          >
             {inFlight ? "Working…" : "Download"}
           </button>
         )}

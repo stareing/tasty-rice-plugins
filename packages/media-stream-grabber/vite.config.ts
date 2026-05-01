@@ -23,6 +23,8 @@ export default defineConfig({
       // so Vite transforms its <script src="./index.ts"> reference.
       input: {
         offscreen: resolve(here, "src/offscreen/index.html"),
+        manager: resolve(here, "src/manager/index.html"),
+        options: resolve(here, "src/options/index.html"),
       },
     },
   },

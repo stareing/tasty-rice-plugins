@@ -20,9 +20,9 @@
 | Beta releases                   | 1                                           |
 | Unreleased / WIP                | 0                                           |
 | Categories shipped              | Chrome extension                            |
-| Total source LOC (TS/TSX/CSS)   | ~3,300                                      |
-| Total source files              | 12                                          |
-| Latest published release        | [`v0.1.0`](https://github.com/stareing/tasty-rice-plugins/releases/latest) |
+| Total source LOC (TS/TSX/CSS)   | ~9,000                                      |
+| Total source files              | 20                                          |
+| Latest published release        | [`v0.5.0`](https://github.com/stareing/tasty-rice-plugins/releases/latest) |
 | Release flow                    | tag-driven (`v*` → GitHub Actions → ZIP attached) |
 
 ---
@@ -44,14 +44,14 @@ merges segmented streams into a single playable file.
 | **Slug**          | `media-stream-grabber`                                                                                                      |
 | **Status**        | Beta                                                                                                                        |
 | **Category**      | Chrome MV3 extension (Chromium ≥ 88: Chrome / Edge / Brave / Vivaldi / Arc / Opera)                                         |
-| **Latest tag**    | [`v0.1.0`](https://github.com/stareing/tasty-rice-plugins/releases/tag/v0.1.0)                                              |
-| **Source version**| `0.2.0` (unreleased — DASH support, see commits)                                                                            |
-| **Stack**         | TypeScript · React · Vite · CRXJS · `ffmpeg.wasm`                                                                           |
-| **Source LOC**    | ~3,300 across 12 files                                                                                                      |
-| **Runtime deps**  | 4 (`@ffmpeg/ffmpeg`, `@ffmpeg/util`, `react`, `react-dom`)                                                                  |
+| **Latest tag**    | [`v0.5.0`](https://github.com/stareing/tasty-rice-plugins/releases/tag/v0.5.0)                                              |
+| **Source version**| `0.6.0` (unreleased — focus scoring + batch download, see commits)                                                          |
+| **Stack**         | TypeScript · React · Vite · CRXJS · `ffmpeg.wasm` (bundled)                                                                 |
+| **Source LOC**    | ~9,000 across 20 files                                                                                                      |
+| **Runtime deps**  | 4 (`@ffmpeg/core`, `@ffmpeg/ffmpeg`, `react`, `react-dom`)                                                                  |
 | **Dev deps**      | 8                                                                                                                           |
-| **Build size**    | 784 KB unpacked · **192 KB zipped**                                                                                         |
-| **Permissions**   | `webRequest` · `downloads` · `offscreen` · `storage` · `tabs` · `activeTab` · `scripting` · `contextMenus` · `notifications` |
+| **Build size**    | 32 MB unpacked (ffmpeg-core wasm bundled) · **~11 MB zipped**                                                               |
+| **Permissions**   | `webRequest` · `declarativeNetRequestWithHostAccess` · `downloads` · `offscreen` · `storage` · `tabs` · `activeTab` · `scripting` · `contextMenus` · `notifications` |
 | **Install**       | [Download latest ZIP](https://github.com/stareing/tasty-rice-plugins/releases/latest/download/media-stream-grabber.zip)     |
 | **Docs**          | [README](./packages/media-stream-grabber/README.md) · [Install (EN)](./packages/media-stream-grabber/INSTALL.md) · [Install (中文)](./packages/media-stream-grabber/INSTALL.zh.md) |
 | **Source**        | [`packages/media-stream-grabber/`](./packages/media-stream-grabber/)                                                        |
@@ -61,9 +61,13 @@ merges segmented streams into a single playable file.
 
 ## Release history
 
-| Version  | Date       | Plugins changed         | Asset (ZIP)                                                                                              | Highlights                                |
-| -------- | ---------- | ----------------------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
-| `v0.1.0` | 2026-04-28 | `media-stream-grabber`  | [`media-stream-grabber.zip`](https://github.com/stareing/tasty-rice-plugins/releases/latest/download/media-stream-grabber.zip) (192 KB) | First public release · HLS pipeline · context menus |
+| Version  | Plugins changed         | Asset (ZIP)                                                                                              | Highlights                                                                       |
+| -------- | ----------------------- | -------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `v0.5.0` | `media-stream-grabber`  | [`media-stream-grabber.zip`](https://github.com/stareing/tasty-rice-plugins/releases/latest/download/media-stream-grabber.zip) (~11 MB) | Page-sniff mode · category filter · audio-track validation                       |
+| `v0.4.x` | `media-stream-grabber`  | versioned ZIPs only                                                                                      | ffmpeg-core bundled locally · targeted HLS capture · audio-mux verification      |
+| `v0.3.0` | `media-stream-grabber`  | versioned ZIPs only                                                                                      | Right-click capture · AES-128 sequence-number fix                                |
+| `v0.2.0` | `media-stream-grabber`  | versioned ZIPs only                                                                                      | DASH MPD pipeline · WebVTT subtitle merging                                      |
+| `v0.1.0` | `media-stream-grabber`  | versioned ZIPs only                                                                                      | First public release · HLS pipeline · context menus                              |
 
 Stable URL — always points at the latest release of any plugin:
 `https://github.com/stareing/tasty-rice-plugins/releases/latest/download/<slug>.zip`
@@ -75,9 +79,9 @@ Stable URL — always points at the latest release of any plugin:
 | Item                     | Count                                                |
 | ------------------------ | ---------------------------------------------------- |
 | Plugins                  | 1                                                    |
-| Workspace commits        | 6 (`git rev-list --count HEAD`)                      |
+| Workspace commits        | 16 (`git rev-list --count HEAD`)                     |
 | GitHub Actions workflows | 2 (`ci.yml`, `release.yml`)                          |
-| Languages                | TypeScript (98%) · CSS (2%)                          |
+| Languages                | TypeScript (97%) · CSS (3%)                          |
 | Workspace shared deps    | 2 dev (`adm-zip`, `typescript`)                      |
 
 ---
