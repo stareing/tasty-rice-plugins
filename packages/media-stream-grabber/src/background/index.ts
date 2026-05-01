@@ -31,11 +31,19 @@ import type {
 import {
   classify,
   hashId,
+  isIconUrl,
+  isLosslessAudio,
   suggestedFilename,
   suggestedFilenameAsync,
 } from "@/lib/streamClassify";
 import { scoreStream } from "@/lib/streamScore";
 import { installBridge, installCrawler, installProxyFetch } from "./injected";
+import {
+  clearTabFingerprints,
+  dedupCheck,
+  dropStreamFingerprint,
+  handleFingerprintResult,
+} from "./imageDedup";
 
 const STREAM_SEGMENT_RE = /\.(ts|m4s|cmfv|cmfa|mp4v|mp4a)(\?|$|#)/i;
 /**
@@ -126,6 +134,23 @@ let focusByTab: Map<number, FocusContext> = new Map();
  * navigation / tab close in lockstep with the other tab-bound state.
  */
 const tabFlags: Map<number, { drm?: boolean; mse?: boolean }> = new Map();
+
+/**
+ * Per-tab cache of master-playlist URLs already probed by `probeForMaster`.
+ * Bounded by master-candidate count (≤ 6 per child playlist) and cleared in
+ * lockstep with `streamsByTab`. Without this, a tab that sniffs ten variants
+ * would fan out ten parallel probe storms hitting the same candidate URLs.
+ */
+const masterProbeAttempts = new Map<number, Set<string>>();
+
+/**
+ * Pending "create virtual MSE stream" timers, keyed by tab. Set by the
+ * `mse-active` flag handler; cleared if a real HLS/DASH/MP4 lands for the
+ * tab in the meantime, or on tab navigate / close. The 3s delay gives the
+ * page room to also reveal a sniffable manifest URL — if it does, we
+ * prefer that over the synthetic record-from-MSE flow.
+ */
+const mseActiveTimers = new Map<number, ReturnType<typeof setTimeout>>();
 
 /**
  * Tabs that have MSE capture armed. Per-session chunk-stats accumulate as
@@ -444,6 +469,9 @@ async function admitStream(args: {
   frameId?: number;
   referer?: string;
   source?: DetectedStream["source"];
+  /** Optional shape metadata from the page-side probe. Merged with URL-
+   *  derived heuristics (`isLosslessAudio`, `isIconUrl`) before storing. */
+  metadata?: DetectedStream["metadata"];
 }): Promise<DetectedStream | undefined> {
   const { tabId, url } = args;
   if (!url || url.startsWith("blob:") || url.startsWith("data:")) return undefined;
@@ -463,6 +491,20 @@ async function admitStream(args: {
   // of the same master collapse into one row.
   const dedupeKey = streamGroupKey(kind, url);
   const flags = tabFlags.get(tabId);
+  // Merge URL/extension-derived heuristics with whatever the page-side probe
+  // attached. Page-side wins on dimensions/duration (it has the real DOM
+  // values); URL heuristics fill in `lossless` / `isIcon` which the DOM
+  // probe never provides.
+  const metaInbound = args.metadata;
+  const derivedMetadata: DetectedStream["metadata"] = (() => {
+    const md: NonNullable<DetectedStream["metadata"]> = { ...(metaInbound || {}) };
+    if (kind === "audio" && isLosslessAudio(url, args.contentType)) {
+      md.lossless = true;
+    } else if (kind === "image" && isIconUrl(url, args.contentType)) {
+      md.isIcon = true;
+    }
+    return Object.keys(md).length > 0 ? md : undefined;
+  })();
   const stream: DetectedStream = {
     id: hashId(dedupeKey),
     url,
@@ -486,6 +528,7 @@ async function admitStream(args: {
     drmDetected: flags?.drm,
     mseDetected: flags?.mse,
     source: args.source ?? "web-request",
+    metadata: derivedMetadata,
   };
   // Score after the rest of the record is built so all fields the scorer
   // reads (kind, source, frameId, drmDetected, mseDetected, …) are settled.
@@ -505,7 +548,333 @@ async function admitStream(args: {
     });
   void updateBadge(tabId);
   enqueueThumb(tabId, stream);
+
+  // A real manifest landing supersedes the deferred MSE virtual-stream —
+  // cancel the pending timer so we don't surface both rows for the same tab.
+  if (kind === "hls" || kind === "dash" || kind === "mp4") {
+    const t = mseActiveTimers.get(tabId);
+    if (t) {
+      clearTimeout(t);
+      mseActiveTimers.delete(tabId);
+    }
+  }
+
+  // HLS child-playlist → master probe. Triggered only for kind === "hls"
+  // URLs that match the ABR child pattern; the probe walks the parent
+  // directories looking for a real master.m3u8 / playlist.m3u8 / etc. so
+  // the user sees every rendition instead of the single tier the page
+  // happened to load. Fire-and-forget — the probe admits its own results
+  // through admitStream, so the final UI update flows through the same
+  // path as a directly-sniffed master.
+  if (kind === "hls" && HLS_CHILD_PLAYLIST_RE.test(url) && !stream.virtual) {
+    void probeForMaster(tabId, url, args.pageUrl, args.pageTitle).catch(() => {
+      /* probe failures are silent — webRequest sniffer still shows the child */
+    });
+  }
+
+  // Image dedup. Page-side metadata gives us dimensions, but the canonical
+  // signal comes from the actual decoded bitmap inside `dedupCheck`. The
+  // pipeline is fire-and-forget — the row is already broadcast to the popup;
+  // if it loses the dedup contest, `dropStream` removes it after the fact.
+  // The fingerprint compute itself runs in the offscreen document (proper
+  // pHash via 32×32 → DCT → 8×8 low-freq block); we ensure the offscreen
+  // is up before each round, lazy-creating on first image admission.
+  if (kind === "image") {
+    void (async () => {
+      try {
+        await ensureOffscreen();
+        await waitForOffscreenReady();
+      } catch {
+        return;
+      }
+      const res = await dedupCheck({
+        tabId,
+        streamId: stream.id,
+        url: stream.url,
+        referer: stream.referer,
+      }).catch(() => undefined);
+      if (!res || !res.duplicate) return;
+      void dropStream(tabId, res.loserId);
+    })();
+  }
+
   return stream;
+}
+
+/**
+ * Remove a stream from `streamsByTab` after admission and broadcast the
+ * removal to any open popup. Currently called only by the image-dedup
+ * pipeline when two sniffed images turn out to be the same photo at
+ * different resolutions; the loser of that contest is dropped here.
+ */
+async function dropStream(tabId: number, streamId: string): Promise<void> {
+  const list = streamsByTab.get(tabId);
+  if (!list) return;
+  const next = list.filter((s) => s.id !== streamId);
+  if (next.length === list.length) return;
+  streamsByTab.set(tabId, next);
+  dropStreamFingerprint(tabId, streamId);
+  void persistStreams();
+  void chrome.runtime
+    .sendMessage({
+      type: "streams:removed",
+      tabId,
+      streamId,
+      target: "sw",
+    } satisfies RuntimeMessage)
+    .catch(() => {
+      /* popup closed — fine */
+    });
+  void updateBadge(tabId);
+}
+
+/**
+ * Generate plausible master-playlist candidate URLs for a sniffed child
+ * playlist. Bounded to ≤ 6 candidates per call so the probe storm is
+ * trivial: the regex-rewritten canonical, then `master.m3u8` / `playlist.m3u8`
+ * / `index.m3u8` / `manifest.m3u8` at the immediate parent directory and one
+ * level above. Query string is preserved when present — many CDNs sign URLs
+ * with a path-scoped token that travels unchanged across siblings.
+ */
+function generateMasterCandidates(childUrl: string): string[] {
+  const out: string[] = [];
+  let u: URL;
+  try {
+    u = new URL(childUrl);
+  } catch {
+    return out;
+  }
+  const search = u.search;
+
+  const canonical = canonicalHlsMasterUrl(childUrl);
+  if (canonical && canonical !== childUrl) out.push(canonical);
+
+  const parent = u.pathname.replace(/\/[^/]*$/, "/");
+  const grand = parent.length > 1 ? parent.replace(/[^/]+\/$/, "") : "";
+  const masterNames = ["master.m3u8", "playlist.m3u8", "index.m3u8", "manifest.m3u8"];
+  for (const dir of [parent, grand]) {
+    if (!dir) continue;
+    for (const name of masterNames) {
+      out.push(`${u.origin}${dir}${name}${search}`);
+    }
+  }
+
+  // Dedupe + drop the original URL itself.
+  const seen = new Set<string>();
+  return out.filter((c) => {
+    if (c === childUrl) return false;
+    if (seen.has(c)) return false;
+    seen.add(c);
+    return true;
+  });
+}
+
+/**
+ * Page-proxy fetch reachable from the SW. Mirrors the offscreen helper in
+ * `proxyFetchBytes`: send `target: "page-proxy"` to the tab's bridge,
+ * receive the page-side fetch result. Used by `probeForMaster` so master-
+ * candidate fetches that 401/403 the SW (because the CDN signs against
+ * page-runtime auth) can still succeed when the bridge is in place.
+ *
+ * Returns the bytes on success; resolves to `undefined` on any failure
+ * (no bridge, status not ok, structured-clone shape mismatch). Does NOT
+ * throw — callers iterate over candidates and a thrown error would abort
+ * the whole probe instead of just falling through to the next candidate.
+ */
+async function pageProxyFetch(
+  tabId: number,
+  url: string,
+): Promise<Uint8Array | undefined> {
+  return new Promise((resolve) => {
+    try {
+      chrome.tabs.sendMessage(
+        tabId,
+        {
+          target: "page-proxy",
+          type: "page-proxy:fetch",
+          url,
+          method: "GET",
+          headers: {},
+        },
+        (resp) => {
+          const lastErr = chrome.runtime.lastError;
+          if (lastErr) {
+            resolve(undefined);
+            return;
+          }
+          if (!resp || !resp.ok || !resp.bytes) {
+            resolve(undefined);
+            return;
+          }
+          if (resp.bytes instanceof Uint8Array) {
+            resolve(resp.bytes);
+            return;
+          }
+          // structured-clone may flatten the typed array into a numeric-keyed
+          // plain object; reconstruct so callers can decode without checks.
+          const arr = resp.bytes as { [k: number]: number; length?: number };
+          const length =
+            typeof arr.length === "number" ? arr.length : Object.keys(arr).length;
+          const out = new Uint8Array(length);
+          for (let i = 0; i < length; i++) out[i] = arr[i] ?? 0;
+          resolve(out);
+        },
+      );
+    } catch {
+      resolve(undefined);
+    }
+  });
+}
+
+/**
+ * Probe for the master playlist behind a sniffed ABR child playlist.
+ * Fires once per (tab, candidate-url) pair; the per-tab attempt set is
+ * cleared in lockstep with `streamsByTab` (navigation, close, manual clear).
+ *
+ * The function is fire-and-forget: callers `void` it. Each candidate is
+ * tried with a direct SW fetch first, then a page-proxy fallback when the
+ * direct fetch returns a status ≥ 400 or throws. The first body that parses
+ * as a valid HLS master (begins with `#EXTM3U`, contains `#EXT-X-STREAM-INF:`)
+ * is admitted via `admitStream` — the regular dedupe + persistence flow takes
+ * over from there, so no special-case handling for probe-sourced rows.
+ */
+async function probeForMaster(
+  tabId: number,
+  childUrl: string,
+  pageUrl?: string,
+  pageTitle?: string,
+): Promise<void> {
+  let attempted = masterProbeAttempts.get(tabId);
+  if (!attempted) {
+    attempted = new Set();
+    masterProbeAttempts.set(tabId, attempted);
+  }
+  const candidates = generateMasterCandidates(childUrl);
+  for (const candidate of candidates) {
+    if (attempted.has(candidate)) continue;
+    attempted.add(candidate);
+
+    let body: string | undefined;
+    // Direct SW fetch first — cheaper and avoids the page round-trip when
+    // the CDN is happy without page-runtime auth.
+    try {
+      const res = await fetch(candidate, { credentials: "include" });
+      if (res.ok) body = await res.text();
+    } catch {
+      /* fall through to page-proxy */
+    }
+    // Page-proxy fallback — covers signed-cookie / token CDNs that 401/403
+    // the SW. Bridge presence is conditional on the tab being armed; when
+    // it isn't, the helper resolves to undefined and we move on.
+    if (!body) {
+      const bytes = await pageProxyFetch(tabId, candidate);
+      if (bytes) {
+        try {
+          body = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+        } catch {
+          body = undefined;
+        }
+      }
+    }
+    if (!body) continue;
+    if (!body.startsWith("#EXTM3U")) continue;
+    // Master playlists are the only HLS shape that carries STREAM-INF tags.
+    // A media playlist fetched at one of our candidate names would parse as
+    // valid HLS but not carry STREAM-INF — skip it so we don't surface a
+    // duplicate of the sniffed child under a different name.
+    if (!/#EXT-X-STREAM-INF:/m.test(body)) continue;
+
+    await admitStream({
+      tabId,
+      url: candidate,
+      kind: "hls",
+      contentType: "application/vnd.apple.mpegurl",
+      pageUrl,
+      pageTitle,
+      // Mark the source as "page-crawler" — the row deserves the same focus-
+      // score boost as a fetch/XHR-derived hit (this is the *page's* master,
+      // not a sibling tab's). The webRequest sniffer never sees this URL
+      // because the page itself doesn't fetch it during normal playback.
+      source: "page-crawler",
+    });
+    return; // first hit wins — stop probing further candidates
+  }
+}
+
+/**
+ * Schedule creation of a synthetic MSE-recording stream for `tabId`. Fires
+ * once per `mse-active` flag burst; cancelled on tab navigate / close or
+ * when a real HLS/DASH/MP4 stream lands inside the 3s delay.
+ *
+ * The synthetic row uses a placeholder URL (`mse://capture/...`) and is
+ * marked `virtual: "mse"` — the popup short-circuits its Download click to
+ * arm MSE capture instead of calling `chrome.downloads.download` against an
+ * unfetchable scheme.
+ */
+function scheduleMseVirtualStream(tabId: number): void {
+  if (mseActiveTimers.has(tabId)) return;
+  // Already covered by a real manifest? skip — common when the page exposes
+  // both a sniffable HLS and feeds it through MSE simultaneously.
+  const existing = streamsByTab.get(tabId);
+  if (
+    existing?.some(
+      (s) =>
+        s.kind === "hls" || s.kind === "dash" || s.kind === "mp4" || s.virtual === "mse",
+    )
+  ) {
+    return;
+  }
+  const timer = setTimeout(async () => {
+    mseActiveTimers.delete(tabId);
+    const list = streamsByTab.get(tabId) ?? [];
+    if (
+      list.some(
+        (s) =>
+          s.kind === "hls" ||
+          s.kind === "dash" ||
+          s.kind === "mp4" ||
+          s.virtual === "mse",
+      )
+    ) {
+      return;
+    }
+    const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+    let host = "page";
+    try {
+      if (tab?.url) host = new URL(tab.url).host.replace(/^www\./, "");
+    } catch {
+      /* ignore — fall back to "page" */
+    }
+    const ts = Date.now().toString(36);
+    const url = `mse://capture/${tabId}/${ts}`;
+    const stream: DetectedStream = {
+      id: hashId(url),
+      url,
+      kind: "mp4",
+      suggestedName: `mse-${host}-${ts}.mp4`,
+      detectedAt: Date.now(),
+      pageUrl: tab?.url,
+      pageTitle: tab?.title,
+      mseDetected: true,
+      virtual: "mse",
+      source: "page-crawler",
+    };
+    stream.score = scoreStream(stream, focusByTab.get(tabId), Date.now());
+    if (!addStream(tabId, stream)) return;
+    await persistStreams();
+    void chrome.runtime
+      .sendMessage({
+        type: "streams:added",
+        tabId,
+        stream,
+        target: "sw",
+      } satisfies RuntimeMessage)
+      .catch(() => {
+        /* popup closed — fine */
+      });
+    void updateBadge(tabId);
+  }, 3000);
+  mseActiveTimers.set(tabId, timer);
 }
 
 /**
@@ -985,6 +1354,13 @@ chrome.tabs.onUpdated.addListener((tabId, change) => {
     armedFrame.delete(tabId);
     tabFlags.delete(tabId);
     focusByTab.delete(tabId);
+    masterProbeAttempts.delete(tabId);
+    clearTabFingerprints(tabId);
+    const pendingMse = mseActiveTimers.get(tabId);
+    if (pendingMse) {
+      clearTimeout(pendingMse);
+      mseActiveTimers.delete(tabId);
+    }
     mseCaptureTabs.delete(tabId);
     for (const [sid, stat] of mseSessions) {
       if (stat.tabId === tabId) mseSessions.delete(sid);
@@ -1018,6 +1394,13 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   pageSniffTabs.delete(tabId);
   tabFlags.delete(tabId);
   focusByTab.delete(tabId);
+  masterProbeAttempts.delete(tabId);
+  clearTabFingerprints(tabId);
+  const pendingMse = mseActiveTimers.get(tabId);
+  if (pendingMse) {
+    clearTimeout(pendingMse);
+    mseActiveTimers.delete(tabId);
+  }
   mseCaptureTabs.delete(tabId);
   for (const [sid, stat] of mseSessions) {
     if (stat.tabId === tabId) mseSessions.delete(sid);
@@ -1096,6 +1479,7 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, sender, sendResponse)
           pageTitle: tab?.title,
           frameId: sender.frameId,
           source: "page-crawler",
+          metadata: msg.metadata,
         });
         sendResponse({ ok: true });
         return;
@@ -1114,8 +1498,19 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, sender, sendResponse)
           sendResponse({ ok: false, error: "not-armed" });
           return;
         }
+        // `mse-active` is an *activity* flag, not a *capability* flag — it
+        // doesn't add a badge to existing streams; instead it schedules the
+        // synthetic MSE-recording row that surfaces when the page never
+        // exposes a sniffable manifest URL. Distinct path from drm / mse.
+        if (msg.flag === "mse-active") {
+          scheduleMseVirtualStream(tabId);
+          sendResponse({ ok: true });
+          return;
+        }
         const cur = tabFlags.get(tabId) || {};
-        const next = { ...cur, [msg.flag]: true };
+        const next: { drm?: boolean; mse?: boolean } = { ...cur };
+        if (msg.flag === "drm") next.drm = true;
+        if (msg.flag === "mse") next.mse = true;
         tabFlags.set(tabId, next);
         // Patch every existing stream on the tab so the popup row shows
         // the badge without waiting for a new sniff. Re-broadcast each
@@ -1165,6 +1560,13 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, sender, sendResponse)
         streamsByTab.delete(msg.tabId);
         tabFlags.delete(msg.tabId);
         focusByTab.delete(msg.tabId);
+        masterProbeAttempts.delete(msg.tabId);
+        clearTabFingerprints(msg.tabId);
+        const pending = mseActiveTimers.get(msg.tabId);
+        if (pending) {
+          clearTimeout(pending);
+          mseActiveTimers.delete(msg.tabId);
+        }
         await persistStreams();
         await persistFocus();
         await updateBadge(msg.tabId);
@@ -1239,6 +1641,7 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, sender, sendResponse)
             msg.jobId,
             msg.selection ?? {},
             sender.tab?.id,
+            msg.batched,
           );
           sendResponse({ ok: true });
         } catch (err) {
@@ -1435,6 +1838,7 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, sender, sendResponse)
             url: msg.url,
             filename: msg.filename,
             saveAs: msg.saveAs,
+            conflictAction: msg.conflictAction,
           });
           sendResponse({ ok: true });
         } catch (err) {
@@ -1476,6 +1880,10 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, sender, sendResponse)
         if (waiter) waiter();
         return;
       }
+      case "image:fingerprint:result": {
+        handleFingerprintResult(msg);
+        return;
+      }
       case "download:progress": {
         // Mirror progress into the managed-job log so the standalone
         // manager page reflects state without subscribing to the live
@@ -1514,6 +1922,7 @@ async function startDownload(
   jobId: string,
   selection: { variantUri?: string; audioId?: string; subtitleId?: string },
   originTabId?: number,
+  batched?: boolean,
 ): Promise<void> {
   await restoreFromSession();
 
@@ -1523,7 +1932,11 @@ async function startDownload(
       await chrome.downloads.download({
         url: stream.url,
         filename: stream.suggestedName,
-        saveAs: true,
+        // Batch mode: skip the save-as dialog and auto-rename on conflict
+        // so a 50-image gallery doesn't pop 50 dialogs. Single downloads
+        // keep the prompt so the user can change filename / target dir.
+        saveAs: !batched,
+        conflictAction: batched ? "uniquify" : "prompt",
       });
     } finally {
       await removeRefererRule(jobId);
@@ -1557,6 +1970,7 @@ async function startDownload(
       stream,
       jobId,
       selection,
+      batched,
       target: "offscreen",
     } satisfies RuntimeMessage)
     .catch(() => {

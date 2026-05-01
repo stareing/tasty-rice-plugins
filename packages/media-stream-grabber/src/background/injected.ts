@@ -100,14 +100,43 @@ export function installCrawler(opts: CrawlerOptions): void {
     }
   }
 
-  function reportUrl(url: string, contentType?: string): void {
-    postBridge({
+  function reportUrl(
+    url: string,
+    contentType?: string,
+    metadata?: {
+      width?: number;
+      height?: number;
+      durationSec?: number;
+    },
+  ): void {
+    const payload: any = {
       __msg: "msg-crawler",
       nonce: w.__msgCrawler && w.__msgCrawler.nonce,
       url: url,
       contentType: contentType,
       pageUrl: location.href,
-    });
+    };
+    if (metadata) {
+      // Drop empty / non-finite numbers so we never ship `width: NaN`.
+      const md: any = {};
+      if (typeof metadata.width === "number" && isFinite(metadata.width) && metadata.width > 0) {
+        md.width = Math.round(metadata.width);
+      }
+      if (typeof metadata.height === "number" && isFinite(metadata.height) && metadata.height > 0) {
+        md.height = Math.round(metadata.height);
+      }
+      if (
+        typeof metadata.durationSec === "number" &&
+        isFinite(metadata.durationSec) &&
+        metadata.durationSec > 0
+      ) {
+        md.durationSec = metadata.durationSec;
+      }
+      if (md.width !== undefined || md.height !== undefined || md.durationSec !== undefined) {
+        payload.metadata = md;
+      }
+    }
+    postBridge(payload);
   }
 
   function reportFlag(flag: string): void {
@@ -160,19 +189,67 @@ export function installCrawler(opts: CrawlerOptions): void {
     );
   }
 
+  function elementMetadata(el: Element | null):
+    | { width?: number; height?: number; durationSec?: number }
+    | undefined {
+    try {
+      if (!el) return undefined;
+      const tag = (el as any).tagName ? (el as any).tagName.toLowerCase() : "";
+      if (tag === "audio" || tag === "video") {
+        const dur = (el as any).duration;
+        if (typeof dur === "number" && isFinite(dur) && dur > 0) {
+          return { durationSec: dur };
+        }
+      } else if (tag === "img") {
+        const img = el as any as HTMLImageElement;
+        const w = img.naturalWidth || img.width || 0;
+        const h = img.naturalHeight || img.height || 0;
+        if (w > 0 || h > 0) return { width: w, height: h };
+      }
+    } catch (_e) {
+      /* ignore */
+    }
+    return undefined;
+  }
+
   function reportElementSources(el: Element | null): void {
     if (!el) return;
     try {
+      const md = elementMetadata(el);
       const direct = (el as any).currentSrc || (el as any).src;
-      if (isLiveSrc(direct) && looksMedia(direct)) reportUrl(direct);
+      if (isLiveSrc(direct) && looksMedia(direct)) reportUrl(direct, undefined, md);
       if (el.querySelectorAll) {
         const sources = el.querySelectorAll("source");
         for (let i = 0; i < sources.length; i++) {
           const s = (sources[i] as HTMLSourceElement).src ||
             sources[i].getAttribute("src") || "";
-          if (isLiveSrc(s) && looksMedia(s)) reportUrl(s);
+          if (isLiveSrc(s) && looksMedia(s)) reportUrl(s, undefined, md);
         }
       }
+    } catch (_e) {
+      /* ignore */
+    }
+  }
+
+  // <img>-only branch. We intentionally don't run it through `looksMedia`
+  // (which is geared for video/audio extensions) — instead we trust the
+  // element's `src` and let the SW classify by content-type / extension.
+  // Page-sniff gating in the SW (`pageSniffTabs.has(tabId)`) ensures non-
+  // opted-in tabs discard the report; we still emit it so an armed-mode user
+  // who explicitly asked for "all images on this page" gets dimensions.
+  function reportImageElement(el: Element | null): void {
+    if (!el) return;
+    try {
+      const img = el as any as HTMLImageElement;
+      const direct = (img && (img.currentSrc || img.src)) || "";
+      if (!isLiveSrc(direct)) return;
+      // Skip data:/blob: and the rare `<img>` whose src is a 1px tracking GIF —
+      // the SW's classify will reject those, but the cheap dim filter here saves
+      // a round-trip.
+      const w = img.naturalWidth || img.width || 0;
+      const h = img.naturalHeight || img.height || 0;
+      if (w > 0 && h > 0 && w < 8 && h < 8) return;
+      reportUrl(direct, undefined, { width: w, height: h });
     } catch (_e) {
       /* ignore */
     }
@@ -184,6 +261,12 @@ export function installCrawler(opts: CrawlerOptions): void {
       if (!document || !document.querySelectorAll) return;
       const els = document.querySelectorAll("video, audio");
       for (let i = 0; i < els.length; i++) reportElementSources(els[i]);
+      // Image sweep runs unconditionally — the SW gates kind=image by
+      // page-sniff tab membership, so ordinary armed tabs discard these and
+      // the cost is bounded by a `for` loop over the existing DOM. Cap at
+      // 200 to avoid pathological galleries.
+      const imgs = document.querySelectorAll("img");
+      for (let i = 0; i < imgs.length && i < 200; i++) reportImageElement(imgs[i]);
     } catch (_e) {
       /* ignore */
     }
@@ -340,10 +423,16 @@ export function installCrawler(opts: CrawlerOptions): void {
               const tag = n.tagName ? n.tagName.toLowerCase() : "";
               if (tag === "video" || tag === "audio") {
                 reportElementSources(n as Element);
+              } else if (tag === "img") {
+                reportImageElement(n as Element);
               } else if (typeof n.querySelectorAll === "function") {
                 const inner = n.querySelectorAll("video, audio");
                 for (let k = 0; k < inner.length; k++) {
                   reportElementSources(inner[k]);
+                }
+                const innerImgs = n.querySelectorAll("img");
+                for (let k = 0; k < innerImgs.length && k < 50; k++) {
+                  reportImageElement(innerImgs[k]);
                 }
               }
             }
@@ -436,6 +525,21 @@ export function installCrawler(opts: CrawlerOptions): void {
         (SourceBuffer.prototype as any).appendBuffer = function (
           data: ArrayBuffer | ArrayBufferView,
         ) {
+          // Tally appendBuffer activity even when capture is off. Three
+          // payloads is enough to be confident the page is *actively*
+          // playing through MSE rather than just setting up a SourceBuffer
+          // that never fills (rare but possible during failed playback).
+          // The flag fires once per page; the dedupe via `flagsSent` keeps
+          // it cheap on long sessions.
+          try {
+            const state = w.__msgCrawler;
+            if (state && isArmed()) {
+              state.mseAppendCount = (state.mseAppendCount || 0) + 1;
+              if (state.mseAppendCount >= 3) reportFlag("mse-active");
+            }
+          } catch (_e) {
+            /* ignore */
+          }
           try {
             const state = w.__msgCrawler;
             // Capture is opt-in — the SW arms the global flag through the
@@ -785,6 +889,24 @@ export function installBridge(opts: BridgeOptions): void {
 
       if (data.__msg === "msg-crawler") {
         if (typeof data.url !== "string" || !data.url) return;
+        let metadata: any;
+        try {
+          if (data.metadata && typeof data.metadata === "object") {
+            const md: any = {};
+            const w = (data.metadata as any).width;
+            const h = (data.metadata as any).height;
+            const dur = (data.metadata as any).durationSec;
+            if (typeof w === "number" && isFinite(w) && w > 0) md.width = w;
+            if (typeof h === "number" && isFinite(h) && h > 0) md.height = h;
+            if (typeof dur === "number" && isFinite(dur) && dur > 0)
+              md.durationSec = dur;
+            if (md.width !== undefined || md.height !== undefined || md.durationSec !== undefined) {
+              metadata = md;
+            }
+          }
+        } catch (_e) {
+          metadata = undefined;
+        }
         chrome.runtime
           .sendMessage({
             type: "streams:report-direct",
@@ -793,6 +915,7 @@ export function installBridge(opts: BridgeOptions): void {
               typeof data.contentType === "string" ? data.contentType : undefined,
             pageUrl:
               typeof data.pageUrl === "string" ? data.pageUrl : undefined,
+            metadata: metadata,
             target: "sw",
           })
           .catch(function () {
@@ -802,7 +925,12 @@ export function installBridge(opts: BridgeOptions): void {
       }
 
       if (data.__msg === "msg-crawler-flag") {
-        if (data.flag !== "drm" && data.flag !== "mse") return;
+        if (
+          data.flag !== "drm" &&
+          data.flag !== "mse" &&
+          data.flag !== "mse-active"
+        )
+          return;
         chrome.runtime
           .sendMessage({
             type: "streams:report-flag",

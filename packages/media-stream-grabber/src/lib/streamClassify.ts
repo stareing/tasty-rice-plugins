@@ -4,8 +4,36 @@ import type { StreamKind } from "./types";
 const HLS_PATTERNS = [/\.m3u8(\?|$|#)/i, /application\/(vnd\.apple\.)?mpegurl/i];
 const DASH_PATTERNS = [/\.mpd(\?|$|#)/i, /application\/dash\+xml/i];
 const VIDEO_EXT = /\.(mp4|m4v|mkv|webm|mov|ts|flv)(\?|$|#)/i;
-const AUDIO_EXT = /\.(mp3|m4a|aac|ogg|opus|flac|wav)(\?|$|#)/i;
-const IMAGE_EXT = /\.(jpe?g|png|gif|webp|avif|bmp|svg)(\?|$|#)/i;
+const AUDIO_EXT = /\.(mp3|m4a|aac|ogg|opus|flac|wav|alac|ape|dsd|dsf|dff|wv|tak)(\?|$|#)/i;
+const IMAGE_EXT = /\.(jpe?g|png|gif|webp|avif|bmp|heic|heif|tif{1,2})(\?|$|#)/i;
+
+/**
+ * Lossless audio containers / codecs. Used by `isLosslessAudio` to bias
+ * scoring — a FLAC outranks an mp3 on the same page even when the page
+ * fetched both. ALAC ships in `.m4a`, so MIME `audio/x-flac` /
+ * `audio/x-alac` is checked alongside the file extension.
+ */
+const LOSSLESS_EXT = /\.(flac|wav|alac|ape|dsd|dsf|dff|wv|tak)(\?|$|#)/i;
+const LOSSLESS_CT =
+  /^(audio\/(flac|x-flac|wav|wave|x-wav|x-pn-wav|alac|x-alac|ape|x-ape|dsd|x-dsd|wavpack))/i;
+
+/**
+ * URL signatures for icons / favicons / sprite sheets. Matched against the
+ * full URL, so paths like `…/icons/play.svg` and `…/favicon.ico?v=2` both
+ * fall under the "icon" bucket. Kept conservative — a regular product photo
+ * named `icon-of-the-day.jpg` would erroneously match `icon`, so we require
+ * the segment to be a directory or basename component.
+ */
+const ICON_URL_RE =
+  /(?:^|[/?#&=])(?:favicon|favicons|sprites?|icons?|emoji|emojis|logos?)\b|\.ico(\?|$|#)/i;
+
+/**
+ * URL hints that the resource is a high-quality / "original" rendition.
+ * Word-boundary matched so a path component `large` lights up but a
+ * pseudo-randomly-named file containing the substring does not.
+ */
+const QUALITY_HINT_RE =
+  /(?:^|[/?#&=_-])(orig(?:inal)?|large|huge|hires|hi-res|raw|full|maxres|max|hd|fhd|uhd|2k|4k|8k|1080p?|1440p?|2160p?|4320p?)(?:[?#&=_/.-]|$)/i;
 
 /**
  * Subtitles + danmaku ("comment scrolling overlay") share a single "text"
@@ -49,6 +77,12 @@ export function classify(url: string, contentType?: string): StreamKind | null {
 
   if (ct.startsWith("video/") || VIDEO_EXT.test(u)) return "mp4";
   if (ct.startsWith("audio/") || AUDIO_EXT.test(u)) return "audio";
+  // SVGs are rejected before the generic image branch — they are vector
+  // artwork (icons, logos, UI), never the photo a user wanted to grab. The
+  // image-dedup pipeline operates on raster pixels, so SVGs would also be
+  // unhashable. Drop them at the classification gate so they never enter
+  // streamsByTab in the first place.
+  if (ct.includes("image/svg") || /\.svg(\?|$|#)/i.test(u)) return null;
   if (ct.startsWith("image/") || IMAGE_EXT.test(u)) return "image";
 
   // Subtitle / danmaku resources. URL extension is checked before
@@ -145,6 +179,35 @@ export async function suggestedFilenameAsync(
     if (slug) return withExt(slug, ext);
   }
   return suggestedFilename(url, kind, pageTitle, pageUrl);
+}
+
+/** True when URL/Content-Type look like a lossless audio container. */
+export function isLosslessAudio(url: string, contentType?: string): boolean {
+  const ct = (contentType || "").toLowerCase();
+  if (ct && LOSSLESS_CT.test(ct)) return true;
+  if (LOSSLESS_EXT.test(url)) return true;
+  return false;
+}
+
+/**
+ * True when the URL looks like an icon / favicon / sprite. SVG and `.ico`
+ * always match because they're never the photo a user wanted. Larger
+ * images embedded in `/icons/` directories also fall here.
+ */
+export function isIconUrl(url: string, contentType?: string): boolean {
+  const ct = (contentType || "").toLowerCase();
+  if (ct.includes("image/svg")) return true;
+  if (ct.includes("image/x-icon") || ct.includes("image/vnd.microsoft.icon")) return true;
+  return ICON_URL_RE.test(url);
+}
+
+/**
+ * True when the URL contains a quality hint like `large`, `original`, `1080p`.
+ * Used to lift the default image penalty — a hint of "1080p" suggests the
+ * URL really is a photo the user might want, not a thumbnail.
+ */
+export function hasQualityHint(url: string): boolean {
+  return QUALITY_HINT_RE.test(url);
 }
 
 /** djb2 hash → base36; cheap, no crypto needed. */

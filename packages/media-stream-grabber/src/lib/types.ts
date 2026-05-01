@@ -1,5 +1,27 @@
 export type StreamKind = "hls" | "dash" | "mp4" | "audio" | "image" | "text" | "other";
 
+/**
+ * Media-shape metadata captured at sniff time. All fields are optional —
+ * the page-side hook only fills what the DOM exposes (img.naturalWidth,
+ * audio.duration), and URL-only sniffs (webRequest path) leave most empty.
+ *
+ * `lossless`/`isIcon` are URL/extension heuristics, not authoritative — they
+ * exist purely to bias `scoreStream`, not to gate downloads. A FLAC tagged as
+ * `lossless: true` is still ranked above a 128 kbps mp3, but a misidentified
+ * flag changes ranking, never visibility.
+ */
+export interface StreamMetadata {
+  /** Image natural width (px). Set by the page-side `<img>` probe only. */
+  width?: number;
+  height?: number;
+  /** Audio duration in seconds, from HTMLMediaElement.duration. */
+  durationSec?: number;
+  /** URL/extension classified as a lossless audio container. */
+  lossless?: boolean;
+  /** URL pattern classified as an icon / favicon / sprite. */
+  isIcon?: boolean;
+}
+
 export interface DetectedStream {
   /** Stable id derived from URL — used for dedupe + UI keys. */
   id: string;
@@ -45,6 +67,21 @@ export interface DetectedStream {
    * it's a stronger signal that the URL belongs to the page's player.
    */
   source?: "web-request" | "page-crawler";
+  /**
+   * Shape metadata from the page-side probe (image dimensions, audio duration)
+   * or URL/extension heuristics (lossless container, icon-like path). The
+   * scorer reads this to bias ranking — a 4096×2160 image outranks a 24×24
+   * icon, a 4-minute FLAC outranks a 30-second WAV chime. Empty when neither
+   * the DOM probe nor the URL heuristic produced a signal.
+   */
+  metadata?: StreamMetadata;
+  /**
+   * Synthetic stream surfaced when the page has no sniffable manifest URL.
+   * The popup treats `virtual: "mse"` rows as "click to arm MSE capture" —
+   * the URL is a placeholder (`mse://capture/<tabId>/<ts>`) and must never
+   * reach `chrome.downloads.download`.
+   */
+  virtual?: "mse";
   /**
    * 0..100 confidence that this row is the stream the user intended to grab.
    * Computed by `scoreStream()` against the right-click focus context (which
@@ -203,6 +240,14 @@ export type RuntimeMessage = Targeted &
     | { type: "streams:clear"; tabId: number }
     | { type: "streams:added"; tabId: number; stream: DetectedStream }
     /**
+     * SW → popup: a previously-broadcast stream has been removed from
+     * `streamsByTab` (currently the image-dedup pipeline is the only
+     * caller — when two sniffed images turn out to be the same photo at
+     * different resolutions, the smaller one is dropped). The popup
+     * filters its local state by `streamId`.
+     */
+    | { type: "streams:removed"; tabId: number; streamId: string }
+    /**
      * Page-side crawler hit. The MAIN-world hook in the target tab posts to
      * the ISOLATED-world bridge, which forwards as this message. Honoured
      * only while the tab is armed; the SW fills tab/frame from `sender`.
@@ -212,6 +257,12 @@ export type RuntimeMessage = Targeted &
         url: string;
         contentType?: string;
         pageUrl?: string;
+        /**
+         * Optional shape metadata from the page-side probe — width/height
+         * for `<img>`, durationSec for `<audio>`. Forwarded straight onto
+         * `DetectedStream.metadata`.
+         */
+        metadata?: StreamMetadata;
       }
     /**
      * Page-side DRM / MSE detection. Emitted by the MAIN-world crawler when
@@ -221,7 +272,17 @@ export type RuntimeMessage = Targeted &
      */
     | {
         type: "streams:report-flag";
-        flag: "drm" | "mse";
+        /**
+         * `drm` / `mse` are page-runtime *capabilities* — they fire once per
+         * page lifetime when the EME / MediaSource APIs are first touched.
+         * `mse-active` is the *activity* signal — it fires only after the
+         * SourceBuffer has actually accepted multiple `appendBuffer` payloads,
+         * so the SW can distinguish "page constructed a MediaSource but
+         * never used it" (rare) from "page is actively playing through MSE
+         * but hasn't exposed a manifest URL we could sniff" (common — Bilibili,
+         * YouTube, etc.). Only the latter triggers the virtual MSE stream.
+         */
+        flag: "drm" | "mse" | "mse-active";
         pageUrl?: string;
       }
     | { type: "capture:arm"; tabId: number }
@@ -242,12 +303,49 @@ export type RuntimeMessage = Targeted &
         stream: DetectedStream;
         jobId: string;
         selection: DownloadSelection;
+        /**
+         * Set by the popup's batch driver. Direct downloads (image/audio/
+         * mp4/text) skip the save-as dialog and auto-rename on filename
+         * conflict instead of prompting; manifest streams (HLS/DASH) thread
+         * the same flag through to the offscreen so the final remuxed
+         * file lands in the Downloads folder without a per-job picker.
+         */
+        batched?: boolean;
       }
     | { type: "download:progress"; payload: DownloadProgress }
     | { type: "download:cancel"; jobId: string }
-    | { type: "downloads:save"; url: string; filename: string; saveAs: boolean }
+    | {
+        type: "downloads:save";
+        url: string;
+        filename: string;
+        saveAs: boolean;
+        /** Forwarded to chrome.downloads.download — defaults to "prompt"
+         *  when omitted (matches the previous single-download behavior). */
+        conflictAction?: "uniquify" | "overwrite" | "prompt";
+      }
     | { type: "thumb:request"; streamId: string; stream: DetectedStream }
     | { type: "thumb:result"; streamId: string; dataUrl?: string; error?: string }
+    /**
+     * SW → offscreen: compute a perceptual-hash fingerprint for `url`.
+     * Offscreen does the GPU resize + 2D DCT and returns a 64-element
+     * Float32Array (low-frequency 8×8 block, DC zeroed). Used by the
+     * image-dedup pipeline to compare same-aspect-ratio images via
+     * cosine similarity ≥ 0.99.
+     */
+    | {
+        type: "image:fingerprint:request";
+        requestId: string;
+        url: string;
+        referer?: string;
+      }
+    | {
+        type: "image:fingerprint:result";
+        requestId: string;
+        vector?: Float32Array;
+        width?: number;
+        height?: number;
+        error?: string;
+      }
     | { type: "offscreen:ready" }
     /**
      * Offscreen → SW: ask the page hosting `jobId`'s tab to refetch `url`

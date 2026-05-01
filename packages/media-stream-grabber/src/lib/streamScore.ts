@@ -1,3 +1,4 @@
+import { hasQualityHint, isIconUrl, isLosslessAudio } from "./streamClassify";
 import type { DetectedStream, FocusContext } from "./types";
 
 /**
@@ -21,9 +22,42 @@ export function scoreStream(
   // ---- URL / kind shape -----------------------------------------------
   if (stream.kind === "hls" || stream.kind === "dash") s += 25;
   else if (stream.kind === "mp4") s += 15;
-  else if (stream.kind === "audio") s += 5;
-  else if (stream.kind === "image") s -= 25;
-  else if (stream.kind === "text") s -= 10;
+  else if (stream.kind === "audio") {
+    // Lossless containers (FLAC / WAV / ALAC / DSD) score above lossy
+    // formats — when a page exposes both a 320 kbps mp3 preview and a
+    // FLAC original, the original is what the user wants.
+    const lossless = stream.metadata?.lossless ?? isLosslessAudio(stream.url, stream.mimeType);
+    s += lossless ? 12 : 5;
+    // Very short audio (< 5 s) is almost always a UI ping / notification
+    // rather than music. Penalise hard but don't hide — a 4-second voice
+    // memo is still worth surfacing if the user explicitly asked for it.
+    const dur = stream.metadata?.durationSec;
+    if (typeof dur === "number" && dur > 0 && dur < 5) s -= 20;
+  } else if (stream.kind === "image") {
+    // Default image penalty stays at -25, but URL hints / dimensions /
+    // icon detection adjust it. The popup's "image" category filter still
+    // controls whether images are listed at all — this only changes ranking.
+    if (stream.metadata?.isIcon || isIconUrl(stream.url, stream.mimeType)) {
+      s -= 45;
+    } else {
+      const w = stream.metadata?.width ?? 0;
+      const h = stream.metadata?.height ?? 0;
+      const minDim = Math.min(w, h);
+      const maxDim = Math.max(w, h);
+      if (minDim > 0 && minDim < 64) {
+        // Icon-sized — likely an avatar / button graphic.
+        s -= 35;
+      } else if (maxDim >= 1080) {
+        // Photo-sized — bias toward visibility.
+        s -= 5;
+      } else if (hasQualityHint(stream.url)) {
+        // No dimensions probed yet, but the URL says "original" / "large".
+        s -= 10;
+      } else {
+        s -= 25;
+      }
+    }
+  } else if (stream.kind === "text") s -= 10;
 
   if (MANIFEST_RE.test(stream.url)) s += 10;
   if (AD_HOST_RE.test(stream.url)) s -= 35;

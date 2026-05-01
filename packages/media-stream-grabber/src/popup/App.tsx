@@ -184,6 +184,9 @@ export function App(): JSX.Element {
           return [msg.stream, ...prev];
         });
       }
+      if (msg.type === "streams:removed" && tab?.id && msg.tabId === tab.id) {
+        setStreams((prev) => prev.filter((s) => s.id !== msg.streamId));
+      }
       if (msg.type === "thumb:result" && msg.dataUrl) {
         setStreams((prev) => {
           const idx = prev.findIndex((s) => s.id === msg.streamId);
@@ -354,8 +357,18 @@ export function App(): JSX.Element {
   const runStreamDownload = useCallback(
     async (
       stream: DetectedStream,
-      opts: { autoQuality: boolean },
+      opts: { autoQuality: boolean; batched?: boolean },
     ): Promise<void> => {
+      // Synthetic MSE-recording row: clicking "Download" arms the page-side
+      // SourceBuffer capture instead of fetching the placeholder URL. The
+      // MSE panel renders automatically once the SW broadcasts `mse:status`
+      // back, so we don't need to also drive a job through the normal flow.
+      if (stream.virtual === "mse") {
+        if (!tab?.id) return;
+        await send({ type: "mse:arm", tabId: tab.id, enable: true });
+        return;
+      }
+
       const jobId = `${stream.id}-${Date.now().toString(36)}`;
       jobToStreamRef.current.set(jobId, stream.id);
       setProgress((prev) => ({
@@ -491,14 +504,14 @@ export function App(): JSX.Element {
           selection = picked;
         }
 
-        await send({ type: "download:start", stream, jobId, selection });
+        await send({ type: "download:start", stream, jobId, selection, batched: opts.batched });
       } else {
-        await send({ type: "download:start", stream, jobId, selection: {} });
+        await send({ type: "download:start", stream, jobId, selection: {}, batched: opts.batched });
       }
 
       await waitForJobEnd(jobId);
     },
-    [],
+    [tab?.id],
   );
 
   const onDownload = useCallback(
@@ -543,11 +556,15 @@ export function App(): JSX.Element {
     });
   }, []);
 
-  // Skip-rules from the spec: never queue images, never queue a stream that
-  // already has an in-flight job, and dedupe by URL/id at queue-build time.
+  // Skip-rules: never queue a stream that already has an in-flight job, and
+  // dedupe by URL/id at queue-build time. Virtual MSE rows are excluded —
+  // clicking them arms the page-side capture, which doesn't compose with
+  // the sequential per-stream queue. Image / audio rows are batchable; the
+  // SW skips the save-as dialog and auto-renames on filename conflict when
+  // the popup passes `batched: true` through `download:start`.
   const isStreamBatchable = useCallback(
     (s: DetectedStream): boolean => {
-      if (s.kind === "image") return false;
+      if (s.virtual === "mse") return false;
       for (const [jobId, sid] of jobToStreamRef.current) {
         if (sid !== s.id) continue;
         const p = progress[jobId];
@@ -596,7 +613,7 @@ export function App(): JSX.Element {
           currentStreamId: s.id,
         });
         try {
-          await runStreamDownload(s, { autoQuality: useAutoQuality });
+          await runStreamDownload(s, { autoQuality: useAutoQuality, batched: true });
         } catch {
           // Per-job error is already surfaced via download:progress; keep
           // the queue moving.
@@ -935,6 +952,7 @@ function StreamCard({
   onRequestThumb: () => void;
   onToggleSelect: () => void;
 }): JSX.Element {
+  const isVirtualMse = stream.virtual === "mse";
   const tagClass = `stream__tag stream__tag--${stream.kind}`;
   const inFlight = progress && progress.phase !== "done" && progress.phase !== "error";
   const ratio = Math.max(0, Math.min(1, progress?.ratio ?? 0));
@@ -943,7 +961,14 @@ function StreamCard({
   // (auto-enqueued by the SW; the "Preview" button is a manual retry).
   const thumbSrc =
     stream.kind === "image" ? stream.url : stream.thumbDataUrl;
-  const canExtract = stream.kind === "hls" || stream.kind === "dash" || stream.kind === "mp4" || stream.kind === "audio";
+  // Virtual MSE rows have no fetchable URL — preview / copy / thumb extract
+  // all rely on a real source, so suppress those affordances.
+  const canExtract =
+    !isVirtualMse &&
+    (stream.kind === "hls" ||
+      stream.kind === "dash" ||
+      stream.kind === "mp4" ||
+      stream.kind === "audio");
   const showPreviewButton = !stream.thumbDataUrl && canExtract;
 
   return (
@@ -954,8 +979,8 @@ function StreamCard({
           title={
             selectable
               ? "Include in batch download"
-              : stream.kind === "image"
-                ? "Image rows are not part of the batch downloader"
+              : stream.virtual === "mse"
+                ? "Recording rows are not part of the batch downloader"
                 : "This stream is already downloading"
           }
         >
@@ -977,7 +1002,9 @@ function StreamCard({
         </div>
         <div className="stream__meta">
           <div className="stream__head">
-            <span className={tagClass}>{KIND_LABEL[stream.kind]}</span>
+            <span className={tagClass}>
+              {isVirtualMse ? "REC" : KIND_LABEL[stream.kind]}
+            </span>
             <span className="stream__name" title={stream.suggestedName}>
               {stream.suggestedName}
             </span>
@@ -989,7 +1016,7 @@ function StreamCard({
                 DRM
               </span>
             ) : null}
-            {stream.mseDetected && !stream.drmDetected ? (
+            {stream.mseDetected && !stream.drmDetected && !isVirtualMse ? (
               <span
                 className="stream__pill stream__pill--mse"
                 title="The page feeds the player through MediaSource. The visible video.src may be a blob: URL — this row is the underlying source."
@@ -1006,13 +1033,15 @@ function StreamCard({
               </span>
             ) : null}
           </div>
-          <p className="stream__url" title={stream.url}>
-            {stream.url}
+          <p className="stream__url" title={isVirtualMse ? "Synthetic stream — clicking Record arms the SourceBuffer capture pipeline." : stream.url}>
+            {isVirtualMse
+              ? "Page is playing through MediaSource without exposing a manifest URL — record the buffer instead."
+              : stream.url}
           </p>
         </div>
       </div>
       <div className="stream__actions">
-        <button onClick={onCopy}>Copy URL</button>
+        {isVirtualMse ? null : <button onClick={onCopy}>Copy URL</button>}
         {showPreviewButton ? (
           <button onClick={onRequestThumb} disabled={thumbLoading}>
             {thumbLoading ? "Extracting…" : "Preview"}
@@ -1027,7 +1056,7 @@ function StreamCard({
             disabled={!!inFlight || batchActive}
             title={batchActive ? "Batch download is running — wait for the queue to finish or stop it." : undefined}
           >
-            {inFlight ? "Working…" : "Download"}
+            {isVirtualMse ? "Record" : inFlight ? "Working…" : "Download"}
           </button>
         )}
       </div>

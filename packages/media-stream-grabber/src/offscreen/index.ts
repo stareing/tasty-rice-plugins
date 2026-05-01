@@ -41,6 +41,7 @@ import {
   type SegmentStore,
 } from "./segmentStorage";
 import { TailLossTracker } from "./tailLoss";
+import { computeImageFingerprint } from "./imageFingerprint";
 
 const cancelled = new Set<string>();
 const SEGMENT_RETRIES = 3;
@@ -81,7 +82,7 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, _sender, sendResponse
     return true;
   }
   if (msg.type === "download:start") {
-    void runDownload(msg.stream, msg.jobId, msg.selection ?? {}).catch((err) => {
+    void runDownload(msg.stream, msg.jobId, msg.selection ?? {}, msg.batched).catch((err) => {
       reportProgress({
         jobId: msg.jobId,
         phase: "error",
@@ -122,6 +123,43 @@ chrome.runtime.onMessage.addListener((msg: RuntimeMessage, _sender, sendResponse
     void finaliseMseSession(msg.sessionId, msg.suggestedName).catch(() => {
       /* surfaces via download:progress error already */
     });
+    sendResponse({ ok: true });
+    return true;
+  }
+  if (msg.type === "image:fingerprint:request") {
+    // Fire-and-forget — the offscreen replies via a separate
+    // `image:fingerprint:result` broadcast keyed by `requestId`. We do not
+    // use sendResponse for the result because the SW pairs the response by
+    // requestId from a sendMessage listener, which works uniformly whether
+    // the offscreen is currently responsive to sendResponse or not.
+    const requestId = msg.requestId;
+    const url = msg.url;
+    const referer = msg.referer;
+    void computeImageFingerprint(url, referer)
+      .then((res) => {
+        void chrome.runtime
+          .sendMessage({
+            type: "image:fingerprint:result",
+            requestId,
+            vector: res?.vector,
+            width: res?.width,
+            height: res?.height,
+            target: "sw",
+          } satisfies RuntimeMessage)
+          .catch(() => {
+            /* SW evicted — drop the result */
+          });
+      })
+      .catch((err) => {
+        void chrome.runtime
+          .sendMessage({
+            type: "image:fingerprint:result",
+            requestId,
+            error: errorMessage(err),
+            target: "sw",
+          } satisfies RuntimeMessage)
+          .catch(() => {});
+      });
     sendResponse({ ok: true });
     return true;
   }
@@ -201,9 +239,14 @@ async function fetchWithBudget(
  * extraction) where there's no committed origin tab to proxy through.
  */
 let activeJobId: string | undefined;
+// Per-job batch flag — set by `runDownload` and read by `saveBlob` so the
+// final remuxed file lands in Downloads/ without a save-as dialog when the
+// popup ran the job through its sequential batch driver.
+let activeJobBatched = false;
 
 function setActiveJobId(id: string | undefined): void {
   activeJobId = id;
+  if (id === undefined) activeJobBatched = false;
 }
 
 async function fetchBytes(
@@ -585,8 +628,10 @@ async function runDownload(
   stream: DetectedStream,
   jobId: string,
   selection: DownloadSelection,
+  batched?: boolean,
 ): Promise<void> {
   setActiveJobId(jobId);
+  activeJobBatched = !!batched;
   try {
     if (stream.kind === "hls") {
       await runDownloadHls(stream, jobId, selection);
@@ -1856,7 +1901,14 @@ async function finaliseMseSession(
 async function saveBlob(blob: Blob, filename: string): Promise<void> {
   const url = URL.createObjectURL(blob);
   try {
-    await requestSwDownload(url, filename, true);
+    // Batch mode: skip the save-as dialog and auto-rename on conflict so a
+    // queued ffmpeg merge doesn't pop a picker for every job in the queue.
+    await requestSwDownload(
+      url,
+      filename,
+      !activeJobBatched,
+      activeJobBatched ? "uniquify" : undefined,
+    );
   } finally {
     setTimeout(() => URL.revokeObjectURL(url), 60_000);
   }
@@ -1866,6 +1918,7 @@ async function requestSwDownload(
   url: string,
   filename: string,
   saveAs: boolean,
+  conflictAction?: "uniquify" | "overwrite" | "prompt",
 ): Promise<void> {
   const resp = await new Promise<{ ok: boolean; error?: string }>((resolve, reject) => {
     chrome.runtime.sendMessage(
@@ -1874,6 +1927,7 @@ async function requestSwDownload(
         url,
         filename,
         saveAs,
+        conflictAction,
         target: "sw",
       } satisfies RuntimeMessage,
       (response: { ok: boolean; error?: string } | undefined) => {
