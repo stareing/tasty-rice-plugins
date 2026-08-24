@@ -37,6 +37,12 @@ import {
   suggestedFilenameAsync,
 } from "@/lib/streamClassify";
 import { scoreStream } from "@/lib/streamScore";
+import {
+  DEFAULT_MIN_SIZE_BYTES,
+  MIN_SIZE_KEY,
+  getMinSizeBytes,
+  passesSizeFilter,
+} from "@/lib/sizeFilter";
 import { installBridge, installCrawler, installProxyFetch } from "./injected";
 import {
   clearTabFingerprints,
@@ -103,6 +109,23 @@ const OFFSCREEN_READY_TIMEOUT_MS = 4_000;
 
 let streamsByTab: Map<number, DetectedStream[]> = new Map();
 let jobsById: Map<string, PersistedJob> = new Map();
+/**
+ * User-configured byte threshold for direct downloads (image/audio/mp4).
+ * Sub-threshold resources are dropped at sniff time using the
+ * `Content-Length` response header. 0 = filter disabled. Refreshed from
+ * `chrome.storage.local` at module load and on every storage change.
+ */
+let minSizeBytes = DEFAULT_MIN_SIZE_BYTES;
+void getMinSizeBytes().then((v) => {
+  minSizeBytes = v;
+});
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  const next = changes[MIN_SIZE_KEY];
+  if (!next) return;
+  const v = next.newValue;
+  minSizeBytes = typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
+});
 let armedUntil: Map<number, number> = new Map();
 /**
  * When set, the armed window for that tab only accepts requests originating
@@ -1326,6 +1349,20 @@ chrome.webRequest.onHeadersReceived.addListener(
     // is for "capture the underlying stream of this <video>" — pulling in
     // every <img> on the page would just bury the actual media.
     if (kind === "image" && !pageSniffTabs.has(details.tabId)) return;
+    // Minimum-size gate. Dropped here so sub-threshold tracking pixels /
+    // ad jingles / preview clips never enter `streamsByTab`. Only applies
+    // to direct binary kinds; manifests + subtitles are exempt.
+    const clHeader = headerLookup(details.responseHeaders, "content-length");
+    const contentLength = clHeader ? parseInt(clHeader, 10) : undefined;
+    if (
+      !passesSizeFilter(
+        kind,
+        Number.isFinite(contentLength) ? contentLength : undefined,
+        minSizeBytes,
+      )
+    ) {
+      return;
+    }
 
     void restoreFromSession().then(async () => {
       const refererEntry = pendingReferers.get(details.url);

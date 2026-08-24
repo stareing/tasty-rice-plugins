@@ -4,6 +4,12 @@ import {
   saveUserRules,
   type UserSiteRule,
 } from "@/lib/siteRules";
+import {
+  bytesToMb,
+  getMinSizeBytes,
+  mbToBytes,
+  setMinSizeBytes,
+} from "@/lib/sizeFilter";
 
 /**
  * Options page: per-site filename rules.
@@ -18,13 +24,27 @@ export function App(): JSX.Element {
   const [rules, setRules] = useState<UserSiteRule[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [minSizeMb, setMinSizeMb] = useState<string>("0");
+  const [minSizeSaved, setMinSizeSaved] = useState<boolean>(false);
 
   useEffect(() => {
     void getUserRules().then((r) => {
       setRules(r);
       setLoaded(true);
     });
+    void getMinSizeBytes().then((b) => {
+      setMinSizeMb(bytesToMb(b).toString());
+    });
   }, []);
+
+  const onSaveMinSize = useCallback(async () => {
+    const parsed = parseFloat(minSizeMb);
+    const mb = Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+    await setMinSizeBytes(mbToBytes(mb));
+    setMinSizeMb(mb.toString());
+    setMinSizeSaved(true);
+    setTimeout(() => setMinSizeSaved(false), 1500);
+  }, [minSizeMb]);
 
   const onSave = useCallback(async () => {
     try {
@@ -76,6 +96,32 @@ export function App(): JSX.Element {
 
   return (
     <div className="app">
+      <header className="manager__toolbar">
+        <span className="manager__title">Minimum download size</span>
+        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <input
+            type="number"
+            min={0}
+            step={0.1}
+            value={minSizeMb}
+            onChange={(e) => setMinSizeMb(e.target.value)}
+            style={{ width: 90 }}
+          />
+          <span>MB</span>
+          <button className="app__btn app__btn--active" onClick={onSaveMinSize}>
+            {minSizeSaved ? "Saved" : "Save"}
+          </button>
+        </div>
+      </header>
+      <p className="options__hint">
+        Resources below this size are filtered before they reach the popup.
+        Applies to direct image / audio / mp4 downloads only — manifests
+        (HLS / DASH) and subtitles are exempt because they are inherently
+        small. Use <code>0</code> to disable. Decisions use the response&apos;s
+        <code>Content-Length</code>; resources without that header always
+        pass through.
+      </p>
+
       <header className="manager__toolbar">
         <span className="manager__title">Site rules</span>
         <div style={{ display: "flex", gap: 6 }}>
